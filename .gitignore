@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Large model files - do not commit directly
+models/
+*.onnx
+
+# Local outputs
+outputs/
+results/
