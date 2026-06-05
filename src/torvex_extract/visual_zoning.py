@@ -10,14 +10,16 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_MODEL_DIR = Path(__file__).parent.parent.parent / "models"
+
 DOCLAYOUT_MODEL_PATH = os.getenv(
     "DOCLAYOUT_MODEL_PATH",
-    "models/PP-DocLayoutV3_ir8.onnx",
+    str(_DEFAULT_MODEL_DIR / "PP-DocLayoutV3_ir8.onnx"),
 )
 
 TATR_MODEL_PATH = os.getenv(
     "TATR_MODEL_PATH",
-    "models/tatr-v1.1-all.onnx",
+    str(_DEFAULT_MODEL_DIR / "tatr-v1.1-all.onnx"),
 )
 # All PDF pages are rendered at 200 DPI in Phase 1.
 # 2026-05-26: tested 150 DPI on scanned Enron 5-page smoke.
