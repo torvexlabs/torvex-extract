@@ -3,12 +3,16 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import sys
+import os
+import shutil
+import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import psutil
 
 from torvex_extract.pypdfium_extractor import extract_with_pypdfium2
 from torvex_extract.visual_zoning import (
@@ -76,6 +80,9 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, tuple):
         return [_json_safe(v) for v in value]
 
+    if isinstance(value, Path):
+        return str(value)
+
     if isinstance(value, np.ndarray):
         return value.tolist()
 
@@ -89,9 +96,130 @@ def _json_safe(value: Any) -> Any:
 
     return value
 
+class ResourceMonitor:
+    def __init__(self, interval_sec: float = 0.25) -> None:
+        self.interval_sec = interval_sec
+        self.pid = os.getpid()
+        self.proc = psutil.Process(self.pid)
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+        self.start_ram_mb = 0.0
+        self.end_ram_mb = 0.0
+        self.peak_ram_mb = 0.0
+
+        self.start_vram_used_mb = 0.0
+        self.end_vram_used_mb = 0.0
+        self.peak_vram_used_mb = 0.0
+
+    def _ram_mb(self) -> float:
+        total = 0
+
+        try:
+            total += self.proc.memory_info().rss
+        except psutil.Error:
+            pass
+
+        try:
+            for child in self.proc.children(recursive=True):
+                try:
+                    total += child.memory_info().rss
+                except psutil.Error:
+                    pass
+        except psutil.Error:
+            pass
+
+        return total / (1024 * 1024)
+
+    def _total_gpu_used_mb(self) -> float:
+        """
+        Return total used VRAM across all NVIDIA GPUs.
+
+        This is more reliable than per-process VRAM on Windows/WDDM,
+        where nvidia-smi compute-app process reporting can miss Python.
+        """
+        if shutil.which("nvidia-smi") is None:
+            return 0.0
+
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=memory.used",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except Exception:
+            return 0.0
+
+        total = 0.0
+
+        for line in result.stdout.splitlines():
+            try:
+                total += float(line.strip())
+            except ValueError:
+                continue
+
+        return total
+
+    def _run(self) -> None:
+        while not self.stop_event.is_set():
+            self.peak_ram_mb = max(self.peak_ram_mb, self._ram_mb())
+            self.peak_vram_used_mb = max(
+                self.peak_vram_used_mb,
+                self._total_gpu_used_mb(),
+            )
+            time.sleep(self.interval_sec)
+
+    def start(self) -> None:
+        self.start_ram_mb = self._ram_mb()
+        self.peak_ram_mb = self.start_ram_mb
+
+        self.start_vram_used_mb = self._total_gpu_used_mb()
+        self.peak_vram_used_mb = self.start_vram_used_mb
+
+        self.thread.start()
+
+    def stop(self) -> dict[str, float]:
+        self.stop_event.set()
+        self.thread.join(timeout=3)
+
+        self.end_ram_mb = self._ram_mb()
+        self.peak_ram_mb = max(self.peak_ram_mb, self.end_ram_mb)
+
+        self.end_vram_used_mb = self._total_gpu_used_mb()
+        self.peak_vram_used_mb = max(
+            self.peak_vram_used_mb,
+            self.end_vram_used_mb,
+        )
+
+        peak_vram_delta_mb = max(
+            0.0,
+            self.peak_vram_used_mb - self.start_vram_used_mb,
+        )
+
+        return {
+            "start_ram_mb": round(self.start_ram_mb, 2),
+            "end_ram_mb": round(self.end_ram_mb, 2),
+            "peak_ram_mb": round(self.peak_ram_mb, 2),
+
+            "start_vram_used_mb": round(self.start_vram_used_mb, 2),
+            "end_vram_used_mb": round(self.end_vram_used_mb, 2),
+            "peak_vram_used_mb": round(self.peak_vram_used_mb, 2),
+            "peak_vram_delta_mb": round(peak_vram_delta_mb, 2),
+        }
+
 
 def _is_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
 
 
 def _is_bbox(value: Any) -> bool:
@@ -434,7 +562,12 @@ def validate_pages(pages: list[dict[str, Any]], errors: list[dict[str, Any]]) ->
     return failures
 
 
-def summarize(pages: list[dict[str, Any]], elapsed_ms: float) -> dict[str, Any]:
+def summarize(
+    pages: list[dict[str, Any]],
+    elapsed_ms: float,
+    device: str,
+    resources: dict[str, float],
+) -> dict[str, Any]:
     safe_pages = pages if isinstance(pages, list) else []
 
     formula_pages_1based = []
@@ -446,8 +579,8 @@ def summarize(pages: list[dict[str, Any]], elapsed_ms: float) -> dict[str, Any]:
         if not formulas:
             continue
 
-        page_index = int(page.get("page_num", 0))      # engine internal: 0-based
-        page_number = page_index + 1                   # PDF viewer: 1-based
+        page_index = int(page.get("page_num", 0))
+        page_number = page_index + 1
 
         formula_pages_1based.append(page_number)
 
@@ -466,8 +599,16 @@ def summarize(pages: list[dict[str, Any]], elapsed_ms: float) -> dict[str, Any]:
 
     return {
         "pages": len(safe_pages),
+        "device": device,
         "elapsed_ms": round(elapsed_ms, 2),
         "ms_per_page": round(elapsed_ms / max(1, len(safe_pages)), 2),
+        "start_ram_mb": resources["start_ram_mb"],
+        "end_ram_mb": resources["end_ram_mb"],
+        "peak_ram_mb": resources["peak_ram_mb"],
+        "start_vram_used_mb": resources["start_vram_used_mb"],
+        "end_vram_used_mb": resources["end_vram_used_mb"],
+        "peak_vram_used_mb": resources["peak_vram_used_mb"],
+        "peak_vram_delta_mb": resources["peak_vram_delta_mb"],
         "text_pages": sum(1 for p in safe_pages if str(p.get("final_text") or "").strip()),
         "table_count": sum(len(p.get("tables") or []) for p in safe_pages),
         "spotlight_count": sum(len(p.get("spotlight_bboxes") or []) for p in safe_pages),
@@ -487,24 +628,43 @@ def summarize(pages: list[dict[str, Any]], elapsed_ms: float) -> dict[str, Any]:
     }
 
 
-def run_one(pdf_path: Path, output_dir: Path) -> int:
+def run_one(pdf_path: Path, output_dir: Path, device: str) -> int:
     print(f"\n[smoke] {pdf_path}")
+    print(f"[smoke] device={device}")
+
+    pages: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+
+    monitor = ResourceMonitor()
+    monitor.start()
 
     started = time.perf_counter()
-    pages, errors = extract_with_pypdfium2(str(pdf_path))
-    elapsed_ms = (time.perf_counter() - started) * 1000.0
+
+    try:
+        pages, errors = extract_with_pypdfium2(str(pdf_path))
+    except Exception as exc:
+        errors = [{"exception": repr(exc)}]
+    finally:
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        resources = monitor.stop()
 
     failures = validate_pages(pages, errors)
-    summary = summarize(pages, elapsed_ms)
+    summary = summarize(
+        pages=pages,
+        elapsed_ms=elapsed_ms,
+        device=device,
+        resources=resources,
+    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    output_json = output_dir / f"{pdf_path.stem}_smoke_output.json"
-    summary_json = output_dir / f"{pdf_path.stem}_smoke_summary.json"
+    output_json = output_dir / f"{pdf_path.stem}_{device}_smoke_output.json"
+    summary_json = output_dir / f"{pdf_path.stem}_{device}_smoke_summary.json"
 
     output_payload = _json_safe(
         {
             "pdf": str(pdf_path),
+            "device": device,
             "errors": errors,
             "pages": pages,
         }
@@ -513,6 +673,7 @@ def run_one(pdf_path: Path, output_dir: Path) -> int:
     summary_payload = _json_safe(
         {
             "pdf": str(pdf_path),
+            "device": device,
             "summary": summary,
             "failures": failures,
         }
@@ -576,6 +737,12 @@ def main() -> int:
         default="results/smoke",
         help="where to write smoke JSON outputs",
     )
+    parser.add_argument(
+        "--device",
+        choices=["cpu", "gpu"],
+        default="cpu",
+        help="device for layout/table ONNX inference. Default: cpu.",
+    )
 
     args = parser.parse_args()
 
@@ -594,15 +761,15 @@ def main() -> int:
         return 1
 
     if not engine.is_warmed():
-        print("[smoke] warming Torvex engine...")
-        engine.warm()
+        print(f"[smoke] warming Torvex engine on {args.device}...")
+        engine.warm(device=args.device)
 
     try:
         status = 0
         output_dir = Path(args.output_dir)
 
         for pdf_path in pdf_paths:
-            status |= run_one(pdf_path, output_dir)
+            status |= run_one(pdf_path, output_dir, args.device)
 
         return status
 
