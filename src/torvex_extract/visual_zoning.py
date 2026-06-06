@@ -8,6 +8,47 @@ from PIL import Image
 
 import numpy as np
 
+_CUDA_DLL_HANDLES = []
+
+
+def _prepare_onnx_cuda_dll_paths() -> None:
+    """
+    Make NVIDIA CUDA/cuDNN wheel DLLs visible on Windows.
+
+    Needed because cuDNN may dynamically load engine DLLs at runtime.
+    """
+    import os
+    import sysconfig
+    from pathlib import Path
+
+    site_packages = Path(sysconfig.get_paths()["purelib"])
+    nvidia_root = site_packages / "nvidia"
+
+    dll_dirs = [
+        nvidia_root / "cudnn" / "bin",
+        nvidia_root / "cublas" / "bin",
+        nvidia_root / "cuda_runtime" / "bin",
+        nvidia_root / "cufft" / "bin",
+        nvidia_root / "curand" / "bin",
+        nvidia_root / "cuda_nvrtc" / "bin",
+        nvidia_root / "nvjitlink" / "bin",
+    ]
+
+    existing_dirs = [path for path in dll_dirs if path.exists()]
+
+    for path in existing_dirs:
+        try:
+            handle = os.add_dll_directory(str(path))
+            _CUDA_DLL_HANDLES.append(handle)
+        except Exception:
+            pass
+
+    current_path = os.environ.get("PATH", "")
+    prepend = ";".join(str(path) for path in existing_dirs)
+
+    if prepend:
+        os.environ["PATH"] = prepend + ";" + current_path
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MODEL_DIR = Path(__file__).parent.parent.parent / "models"
@@ -1273,12 +1314,40 @@ class TorvexExtractEngine:
         self._ocr_backend = "onnxtr_fast_base"
         self._providers = None
 
-
-    def warm(self):
+    def _select_onnx_providers(self, device: str) -> list[str]:
         import onnxruntime as ort
-        import sys
 
-        self._providers = ["CPUExecutionProvider"]
+        requested = (device or "cpu").strip().lower()
+
+        if requested in {"gpu"}:
+            _prepare_onnx_cuda_dll_paths()
+
+            if hasattr(ort, "preload_dlls"):
+                ort.preload_dlls(directory="")
+
+        available = set(ort.get_available_providers())
+
+        if requested == "cpu":
+            return ["CPUExecutionProvider"]
+
+        if requested == "gpu":
+            if "CUDAExecutionProvider" not in available:
+                raise RuntimeError(
+                    "GPU requested, but CUDAExecutionProvider is not available. "
+                    "Install/configure onnxruntime-gpu + CUDA, or use --device cpu."
+                )
+
+            return ["CUDAExecutionProvider"]
+
+        raise ValueError(
+            f"Unsupported device={device!r}. Expected: cpu, gpu."
+        )
+
+    def warm(self, device: str = "cpu"):
+        import sys
+        import onnxruntime as ort
+
+        self._providers = self._select_onnx_providers(device)
 
         self._layout = ort.InferenceSession(
             DOCLAYOUT_MODEL_PATH,
@@ -1289,6 +1358,20 @@ class TorvexExtractEngine:
             TATR_MODEL_PATH,
             providers=self._providers,
         )
+
+        if "CUDAExecutionProvider" in self._providers:
+            layout_providers = set(self._layout.get_providers())
+            tatr_providers = set(self._tatr.get_providers())
+
+            if "CUDAExecutionProvider" not in layout_providers:
+                raise RuntimeError(
+                    f"CUDA requested but layout session providers are {self._layout.get_providers()}"
+                )
+
+            if "CUDAExecutionProvider" not in tatr_providers:
+                raise RuntimeError(
+                    f"CUDA requested but TATR session providers are {self._tatr.get_providers()}"
+                )
 
         # 2026-05-27:
         # OCR routing is page-level in pypdfium_extractor.py.
@@ -1316,12 +1399,19 @@ class TorvexExtractEngine:
             )
 
         elif self._ocr_backend == "onnxtr_fast_base":
-            from onnxtr.models import ocr_predictor
+            from onnxtr.models import EngineConfig, ocr_predictor
+
+            ocr_engine_cfg = EngineConfig(
+                providers=self._providers,
+            )
 
             self._ocr = ocr_predictor(
                 det_arch="fast_base",
                 reco_arch="crnn_mobilenet_v3_small",
                 assume_straight_pages=True,
+                det_engine_cfg=ocr_engine_cfg,
+                reco_engine_cfg=ocr_engine_cfg,
+                clf_engine_cfg=ocr_engine_cfg,
             )
 
         else:
@@ -1336,7 +1426,8 @@ class TorvexExtractEngine:
             raise RuntimeError(f"Paddle module imported unexpectedly: {paddle_mods}")
 
         logger.info(
-            "TorvexExtractEngine warmed successfully with OCR backend=%s",
+            "TorvexExtractEngine warmed successfully with providers=%s OCR backend=%s",
+            self._providers,
             self._ocr_backend,
         )
 
