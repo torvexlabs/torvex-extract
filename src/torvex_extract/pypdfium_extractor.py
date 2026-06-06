@@ -41,6 +41,8 @@ from torvex_extract.visual_zoning import (
     crop_image,
     TRIGGER_ZONE_TYPES,
     SPOTLIGHT_TYPES,
+    FORMULA_ZONE_TYPES,
+    collect_formula_bboxes,
 )
 
 
@@ -477,6 +479,9 @@ def assemble_final_text(zones: list[dict], page: dict) -> str:
         if zone_type in SPOTLIGHT_TYPES:
             continue
 
+        if zone_type in FORMULA_ZONE_TYPES:
+            continue
+
         if zone_type in TRIGGER_ZONE_TYPES:
             # 2026-05-27:
             # Doc 8 IBM degraded/corrupt scanned 10-K exposed a table-only page failure:
@@ -887,6 +892,7 @@ def _process_single_page(
         "zones": [],
         "tier1_bboxes": [],
         "spotlight_bboxes": [],
+        "formula_bboxes": [],
         "tables": [],
         "metadata": {
             "ocr_probe_len": len(probe_text),
@@ -1415,6 +1421,11 @@ def _process_digital_page(
             is_tagged=is_tagged,
         )
 
+        page["formula_bboxes"] = collect_formula_bboxes(
+            zones=zones,
+            page_num=page["page_num"],
+        )
+
         # 2026-05-26:
         # Convert tier1 pdfplumber bordered-table bboxes into pdfium coords.
         # Reason: SAFE zones may overlap already-extracted bordered tables.
@@ -1438,6 +1449,10 @@ def _process_digital_page(
 
             if zone_type in SPOTLIGHT_TYPES:
                 page["spotlight_bboxes"].append(zone["bbox_pdfium"])
+                zone["zone_text"] = ""
+                continue
+
+            if zone_type in FORMULA_ZONE_TYPES:
                 zone["zone_text"] = ""
                 continue
 
@@ -1705,8 +1720,9 @@ def _mark_empty_scanned_page_discarded(
     has_text = bool(str(page.get("final_text") or "").strip())
     has_tables = bool(page.get("tables") or [])
     has_spotlight = bool(page.get("spotlight_bboxes") or [])
+    has_formula = bool(page.get("formula_bboxes") or [])
 
-    if has_text or has_tables or has_spotlight:
+    if has_text or has_tables or has_spotlight or has_formula:
         return
 
     if not page.get("needs_ocr"):
@@ -1816,6 +1832,11 @@ def _process_scanned_page(page: dict, is_tagged: bool) -> None:
         is_tagged=is_tagged,
     )
 
+    page["formula_bboxes"] = collect_formula_bboxes(
+        zones=zones,
+        page_num=page["page_num"],
+    )
+
     # 2026-05-26:
     # Scanned-page performance fix.
     # Old path ran RapidOCR once per SAFE DocLayout zone.
@@ -1829,6 +1850,7 @@ def _process_scanned_page(page: dict, is_tagged: bool) -> None:
         for zone_index, zone in enumerate(zones)
         if zone.get("type", "unknown") not in SPOTLIGHT_TYPES
         and zone.get("type", "unknown") not in TRIGGER_ZONE_TYPES
+        and zone.get("type", "unknown") not in FORMULA_ZONE_TYPES
         and not zone.get("unsafe_for_text")
         and zone.get("bbox_px")
     ]
@@ -1848,6 +1870,10 @@ def _process_scanned_page(page: dict, is_tagged: bool) -> None:
 
         if zone_type in SPOTLIGHT_TYPES:
             page["spotlight_bboxes"].append(zone["bbox_pdfium"])
+            zone["zone_text"] = ""
+            continue
+
+        if zone_type in FORMULA_ZONE_TYPES:
             zone["zone_text"] = ""
             continue
 

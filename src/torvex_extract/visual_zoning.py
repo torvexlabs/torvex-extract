@@ -73,14 +73,11 @@ SAFE_ZONE_TYPES = frozenset(
         "algorithm",
         "aside_text",
         "content",
-        "display_formula",
         "doc_title",
         "figure_title",
         "footer",
         "footnote",
-        "formula_number",
         "header",
-        "inline_formula",
         "paragraph_title",
         "reference",
         "reference_content",
@@ -107,6 +104,47 @@ SPOTLIGHT_TYPES = frozenset(
         "header_image",
     }
 )
+
+FORMULA_ZONE_TYPES = frozenset(
+    {
+        "display_formula",
+        "inline_formula",
+        "formula_number",
+    }
+)
+
+
+def collect_formula_bboxes(
+    zones: list[dict],
+    page_num: int,
+) -> list[dict]:
+    """
+    Collect formula zones as bbox-only artifacts.
+
+    This does not run formula OCR / LaTeX extraction.
+    It only preserves formula detection metadata for future optional formula extraction.
+    """
+    formula_bboxes: list[dict] = []
+
+    for zone_index, zone in enumerate(zones):
+        zone_type = zone.get("type", "unknown")
+
+        if zone_type not in FORMULA_ZONE_TYPES:
+            continue
+
+        formula_bboxes.append(
+            {
+                "formula_id": f"formula_{page_num}_{zone_index}",
+                "type": zone_type,
+                "score": float(zone.get("score", 0.0)),
+                "bbox_px": zone.get("bbox_px"),
+                "bbox_pdfium": zone.get("bbox_pdfium"),
+                "bbox_plumber": zone.get("bbox_plumber"),
+            }
+        )
+
+    return formula_bboxes
+
 
 def image_bbox_to_pdfium_coords(
     bbox_px: list[float],
@@ -850,14 +888,14 @@ def classify_digital_page_zones(zones: list[dict]) -> str:
 
     zone_types = {zone.get("type", "unknown") for zone in zones}
 
-    known_types = SAFE_ZONE_TYPES | TRIGGER_ZONE_TYPES | SPOTLIGHT_TYPES
+    known_types = SAFE_ZONE_TYPES | TRIGGER_ZONE_TYPES | SPOTLIGHT_TYPES | FORMULA_ZONE_TYPES
     unknown_types = zone_types - known_types
 
     if unknown_types:
         logger.warning("Unknown DocLayout zone type(s): %s", sorted(unknown_types))
         return "mixed"
 
-    if zone_types & (TRIGGER_ZONE_TYPES | SPOTLIGHT_TYPES):
+    if zone_types & (TRIGGER_ZONE_TYPES | SPOTLIGHT_TYPES | FORMULA_ZONE_TYPES):
         return "mixed"
 
     return "text_only"
