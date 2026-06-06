@@ -10,3 +10,7 @@ models/
 # Local outputs
 outputs/
 results/
+
+torvex_extract_code_review_bundle.md
+test_docs/
+results/smoke/
