@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from torvex_extract.pure_onnx_mfr import PureOnnxMfr
+
 import gc
 import logging
 import math
 import os
 import re
-import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -59,7 +60,8 @@ _REPEATED_GARBAGE_RE = re.compile(r"(.{1,8})\1{5,}")
 
 @dataclass(frozen=True)
 class FormulaExtractionConfig:
-    model_name: str = "mfr-1.5"
+    model_name: str = "breezedeus/pix2text-mfr-1.5"
+    enabled_formula_types: tuple[str, ...] = ("display_formula",)
     accept_confidence: float = 0.75
     low_confidence: float = 0.55
     padding_ratio: float = 0.04
@@ -353,12 +355,13 @@ class FormulaMfrExtractor:
     Optional Pix2Text-MFR ONNX formula recognizer.
 
     Important:
-    - pix2text is imported lazily only when formula extraction is enabled.
+    - PureOnnxMfr is loaded lazily only when a supported formula type is recognized.
     - This module does not mutate page final_text.
     - It only enriches existing formula bbox artifacts with LaTeX metadata.
 
-    Pix2Text names the recognizer class LatexOCR, but model_name='mfr-1.5'
-    is the Pix2Text MFR model.
+    This uses the local pure ONNXRuntime MFR model:
+    models/pix2text-mfr-1.5
+    No heavy framework wrapper package is required.
     """
 
     def __init__(
@@ -371,43 +374,19 @@ class FormulaMfrExtractor:
         self.config = config or FormulaExtractionConfig()
         self._ocr: Any | None = None
 
-    def _pix2text_device(self) -> str:
-        if self.device in {"gpu", "cuda"}:
-            return "cuda"
-
-        return "cpu"
 
     def _ensure_loaded(self) -> None:
         if self._ocr is not None:
             return
 
-        try:
-            from pix2text.latex_ocr import LatexOCR  # pyright: ignore[reportMissingImports]
-        except ImportError as exc:
-            raise RuntimeError(
-                "Formula extraction requires optional dependencies. "
-                "Install them with: uv sync --extra formula"
-            ) from exc
-
-        model_dir = os.getenv("TORVEX_FORMULA_MODEL_DIR") or None
-        root = os.getenv("TORVEX_FORMULA_ROOT") or None
-
-        kwargs: dict[str, Any] = {
-            "model_name": self.config.model_name,
-            "model_backend": "onnx",
-            "device": self._pix2text_device(),
-            "model_dir": model_dir,
-        }
-
-        if root:
-            kwargs["root"] = root
-
-        self._ocr = LatexOCR(**kwargs)
+        self._ocr = PureOnnxMfr(
+            model_dir=os.getenv("TORVEX_FORMULA_MODEL_DIR") or "models/pix2text-mfr-1.5",
+            device=self.device,
+        )
 
         logger.info(
-            "Loaded Pix2Text-MFR formula extractor: model=%s backend=onnx device=%s",
-            self.config.model_name,
-            self._pix2text_device(),
+            "Loaded pure ONNX MFR model: device=%s",
+            self.device,
         )
 
     def recognize_crop(self, crop: Image.Image) -> dict[str, Any]:
@@ -415,25 +394,10 @@ class FormulaMfrExtractor:
 
         assert self._ocr is not None
 
-        result = self._ocr.recognize(
+        return self._ocr.recognize(
             crop,
-            batch_size=1,
-            use_post_process=True,
+            max_new_tokens=128,
         )
-
-        if isinstance(result, list):
-            result = result[0] if result else {}
-
-        if not isinstance(result, dict):
-            return {
-                "latex": "",
-                "confidence": 0.0,
-            }
-
-        return {
-            "latex": str(result.get("text") or "").strip(),
-            "confidence": _safe_float(result.get("score"), 0.0),
-        }
 
     def _maybe_run_self_consensus(
         self,
@@ -525,6 +489,14 @@ class FormulaMfrExtractor:
             if bbox_px is None:
                 artifact["status"] = "crop_empty"
                 artifact["validation_error"] = "missing_or_invalid_bbox_px"
+                artifacts.append(artifact)
+                continue
+
+            if formula_type not in self.config.enabled_formula_types:
+                artifact["status"] = "skipped_formula_type"
+                artifact["quality_flags"].append(
+                    f"mfr_disabled_for_type:{formula_type}"
+                )
                 artifacts.append(artifact)
                 continue
 
@@ -695,14 +667,3 @@ def extract_formulas_from_bboxes(
 def shutdown_formula_extractor() -> None:
     _EXTRACTORS.clear()
     gc.collect()
-
-    torch_module = sys.modules.get("torch")
-
-    if torch_module is not None:
-        cuda = getattr(torch_module, "cuda", None)
-
-        if cuda is not None and callable(getattr(cuda, "empty_cache", None)):
-            try:
-                cuda.empty_cache()
-            except Exception:
-                pass

@@ -60,8 +60,14 @@ def _summary(
         "formula_count": sum(
             len(page.get("formula_bboxes") or []) for page in pages
         ),
-        "formula_latex_count": sum(
+        "formula_artifact_count": sum(
             len(page.get("formulas") or []) for page in pages
+        ),
+        "formula_latex_count": sum(
+            1
+            for page in pages
+            for formula in (page.get("formulas") or [])
+            if str(formula.get("latex") or "").strip()
         ),
         "formula_accepted_count": sum(
             1

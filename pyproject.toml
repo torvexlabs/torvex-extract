@@ -17,9 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 formula = [
-    "pix2text>=1.1.6",
-    "optimum>=1.23.0",
-    "transformers>=4.37.0",
+    "tokenizers>=0.15.0",
 ]
 
 [project.scripts]
