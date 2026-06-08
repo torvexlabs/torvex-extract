@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 
+from torvex_extract.formula_extractor import shutdown_formula_extractor
 from torvex_extract.pypdfium_extractor import extract_with_pypdfium2
 from torvex_extract.visual_zoning import engine
 
@@ -37,16 +38,37 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
-def _summary(pages: list[dict[str, Any]], errors: list[dict[str, Any]], elapsed_ms: float) -> dict[str, Any]:
+def _summary(
+    pages: list[dict[str, Any]],
+    errors: list[dict[str, Any]],
+    elapsed_ms: float,
+) -> dict[str, Any]:
     return {
         "pages": len(pages),
         "errors": len(errors),
         "elapsed_ms": round(elapsed_ms, 2),
         "ms_per_page": round(elapsed_ms / max(1, len(pages)), 2),
-        "text_pages": sum(1 for page in pages if str(page.get("final_text") or "").strip()),
+        "text_pages": sum(
+            1
+            for page in pages
+            if str(page.get("final_text") or "").strip()
+        ),
         "table_count": sum(len(page.get("tables") or []) for page in pages),
-        "spotlight_count": sum(len(page.get("spotlight_bboxes") or []) for page in pages),
-        "formula_count": sum(len(page.get("formula_bboxes") or []) for page in pages),
+        "spotlight_count": sum(
+            len(page.get("spotlight_bboxes") or []) for page in pages
+        ),
+        "formula_count": sum(
+            len(page.get("formula_bboxes") or []) for page in pages
+        ),
+        "formula_latex_count": sum(
+            len(page.get("formulas") or []) for page in pages
+        ),
+        "formula_accepted_count": sum(
+            1
+            for page in pages
+            for formula in (page.get("formulas") or [])
+            if formula.get("status") == "accepted"
+        ),
         "ocr_pages": sum(1 for page in pages if page.get("needs_ocr")),
     }
 
@@ -54,7 +76,10 @@ def _summary(pages: list[dict[str, Any]], errors: list[dict[str, Any]], elapsed_
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="torvex-extract",
-        description="Extract PDF text, tables, layout zones, spotlight boxes, and formula boxes.",
+        description=(
+            "Extract PDF text, tables, layout zones, spotlight boxes, "
+            "and formula boxes."
+        ),
     )
 
     parser.add_argument(
@@ -74,6 +99,15 @@ def main() -> int:
         choices=["cpu", "gpu"],
         default="cpu",
         help="ONNX inference device for layout/table models. Default: cpu.",
+    )
+
+    parser.add_argument(
+        "--enable-formula",
+        action="store_true",
+        help=(
+            "enable optional Pix2Text-MFR ONNX formula LaTeX extraction "
+            "from detected formula boxes"
+        ),
     )
 
     parser.add_argument(
@@ -100,19 +134,28 @@ def main() -> int:
     print(f"[torvex-extract] input:  {pdf_path}")
     print(f"[torvex-extract] output: {output_path}")
     print(f"[torvex-extract] device: {args.device}")
+    print(
+        f"[torvex-extract] formula: "
+        f"{'enabled' if args.enable_formula else 'disabled'}"
+    )
 
     started = time.perf_counter()
 
     try:
         engine.warm(device=args.device)
 
-        pages, errors = extract_with_pypdfium2(str(pdf_path))
+        pages, errors = extract_with_pypdfium2(
+            str(pdf_path),
+            enable_formula=args.enable_formula,
+            formula_device=args.device,
+        )
 
         elapsed_ms = (time.perf_counter() - started) * 1000.0
 
         payload = {
             "pdf": str(pdf_path),
             "device": args.device,
+            "formula_enabled": args.enable_formula,
             "engine": "torvex_extract",
             "summary": _summary(pages, errors, elapsed_ms),
             "errors": errors,
@@ -142,4 +185,5 @@ def main() -> int:
         return 1
 
     finally:
+        shutdown_formula_extractor()
         engine.shutdown()
