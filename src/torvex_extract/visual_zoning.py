@@ -1378,27 +1378,14 @@ class TorvexExtractEngine:
         # Digital pages do not OCR.
         # Scanned pages use ONNXTR by default.
         #
-        # RapidOCR remains available only for benchmark/fallback runs:
-        #   Torvex_OCR_BACKEND=rapidocr
+        # RapidOCR backend was removed.
+        # ONNXTR fast_base is the only OCR backend.
         self._ocr_backend = os.getenv(
             "Torvex_OCR_BACKEND",
             "onnxtr_fast_base",
-        ).strip().lower()
-
-        if self._ocr_backend == "rapidocr":
-            from rapidocr_onnxruntime import RapidOCR
-
-            self._ocr = RapidOCR(
-                use_cls=True,
-                intra_op_num_threads=int(
-                    os.getenv("Torvex_RAPIDOCR_INTRA_THREADS", "4")
-                ),
-                inter_op_num_threads=int(
-                    os.getenv("Torvex_RAPIDOCR_INTER_THREADS", "1")
-                ),
-            )
-
-        elif self._ocr_backend == "onnxtr_fast_base":
+        ).strip().lower()  
+        
+        if self._ocr_backend == "onnxtr_fast_base":
             from onnxtr.models import EngineConfig, ocr_predictor
 
             ocr_engine_cfg = EngineConfig(
@@ -1413,12 +1400,11 @@ class TorvexExtractEngine:
                 reco_engine_cfg=ocr_engine_cfg,
                 clf_engine_cfg=ocr_engine_cfg,
             )
-
         else:
             raise ValueError(
                 "Unsupported Torvex_OCR_BACKEND="
                 f"{self._ocr_backend!r}. "
-                "Expected 'rapidocr' or 'onnxtr_fast_base'."
+                "Expected 'onnxtr_fast_base'."
             )
 
         paddle_mods = [module for module in sys.modules if "paddle" in module.lower()]
@@ -1456,7 +1442,6 @@ class TorvexExtractEngine:
         2026-05-27:
         Added after ONNXTR backend experiment.
         Smoke reports must show the real OCR backend used by scanned tables:
-            tatr_global_rapidocr
             tatr_global_onnxtr_fast_base
 
         Do not read _ocr_backend directly outside this class.
@@ -1492,11 +1477,10 @@ class TorvexExtractEngine:
         """
         Run OCR on an RGB image crop/page and return Torvex OCR segments.
 
-        Backend is selected by:
-            Torvex_OCR_BACKEND=rapidocr
+        Backend:
             Torvex_OCR_BACKEND=onnxtr_fast_base
 
-        Default OCR backend is ONNXTR fast_base.
+        Default and only OCR backend is ONNXTR fast_base.
 
             OCR routing is page-level:
             digital page -> no OCR
@@ -1507,39 +1491,6 @@ class TorvexExtractEngine:
 
         if image_np is None or image_np.size == 0:
             return []
-
-        if self._ocr_backend == "rapidocr":
-            result, _ = self._ocr(image_np)
-
-            segments: list[dict] = []
-
-            if not result:
-                return segments
-
-            for item in result:
-                try:
-                    bbox, text, score = item[0], item[1], item[2]
-
-                    clean_text = str(text).strip()
-
-                    if not clean_text:
-                        continue
-
-                    if hasattr(bbox, "tolist"):
-                        bbox = bbox.tolist()
-
-                    segments.append(
-                        {
-                            "bbox": bbox,
-                            "text": clean_text,
-                            "score": float(score),
-                        }
-                    )
-
-                except Exception:
-                    continue
-
-            return segments
 
         if self._ocr_backend == "onnxtr_fast_base":
             image_h, image_w = image_np.shape[:2]
