@@ -9,7 +9,6 @@ from typing import Any
 import numpy as np
 import onnxruntime as ort
 from PIL import Image
-from tokenizers import Tokenizer
 
 
 class PureOnnxMfr:
@@ -39,6 +38,14 @@ class PureOnnxMfr:
             str(self.model_dir / "decoder_model.onnx"),
             providers=providers,
         )
+
+        try:
+            from tokenizers import Tokenizer
+        except ImportError as exc:
+            raise RuntimeError(
+                "Formula recognition requires optional dependency 'tokenizers'. "
+                "Install with: uv sync --extra formula"
+            ) from exc
 
         self.tokenizer = Tokenizer.from_file(str(self.model_dir / "tokenizer.json"))
 
