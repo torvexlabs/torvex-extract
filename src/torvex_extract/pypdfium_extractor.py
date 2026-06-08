@@ -52,6 +52,8 @@ from torvex_extract.table_structure import (
     extract_table_explicit_pdfplumber,
 )
 
+from torvex_extract.formula_extractor import extract_formulas_from_bboxes
+
 logger = logging.getLogger(__name__)
 
 LINE_Y_SNAP = 3.0
@@ -783,6 +785,8 @@ def _process_single_page(
     filepath: str,
     is_tagged: bool,
     result_errors: list,
+    enable_formula: bool = False,
+    formula_device: str | None = None,
 ) -> dict:
     """
     Process one PDF page end-to-end.
@@ -893,6 +897,7 @@ def _process_single_page(
         "tier1_bboxes": [],
         "spotlight_bboxes": [],
         "formula_bboxes": [],
+        "formulas": [],
         "tables": [],
         "metadata": {
             "ocr_probe_len": len(probe_text),
@@ -992,6 +997,25 @@ def _process_single_page(
             t0 = time.perf_counter()
             _process_scanned_page(page, is_tagged)
             _record_timing("scanned_page_total", t0)
+
+        if enable_formula and img_np is not None and page.get("formula_bboxes"):
+            t0 = time.perf_counter()
+
+            try:
+                page["formulas"] = extract_formulas_from_bboxes(
+                    img_np=img_np,
+                    formula_bboxes=page.get("formula_bboxes") or [],
+                    page_num=page_idx,
+                    device=formula_device,
+                    fallback_ocr=engine.ocr_image,
+                )
+            except Exception as exc:
+                page["formulas"] = []
+                page["metadata"].setdefault("warnings", []).append(
+                    f"formula extraction failed: {exc}"
+                )
+
+            _record_timing("formula_mfr", t0)
 
     except Exception as exc:
         result_errors.append(
@@ -1991,7 +2015,11 @@ def _process_scanned_page(page: dict, is_tagged: bool) -> None:
         page["metadata"]["quality_score_multiplier"] = 0.60
 
 
-def extract_with_pypdfium2(filepath: str) -> tuple[list[dict], list[dict]]:
+def extract_with_pypdfium2(
+    filepath: str,
+    enable_formula: bool = False,
+    formula_device: str | None = None,
+) -> tuple[list[dict], list[dict]]:
     """
     Extract all pages from one PDF.
 
@@ -2031,6 +2059,8 @@ def extract_with_pypdfium2(filepath: str) -> tuple[list[dict], list[dict]]:
                     filepath=filepath,
                     is_tagged=is_tagged,
                     result_errors=errors,
+                    enable_formula=enable_formula,
+                    formula_device=formula_device,
                 )
                 pages.append(page)
 
