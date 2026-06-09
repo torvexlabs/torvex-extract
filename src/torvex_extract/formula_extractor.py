@@ -8,7 +8,7 @@ import math
 import os
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import Any
 
@@ -58,10 +58,50 @@ _BROKEN_COMMAND_RE = re.compile(r"\\[^A-Za-z{}\s]")
 _REPEATED_GARBAGE_RE = re.compile(r"(.{1,8})\1{5,}")
 
 
+_ALLOWED_FORMULA_TYPES = frozenset(
+    {
+        _DISPLAY_FORMULA_TYPE,
+        _INLINE_FORMULA_TYPE,
+        _FORMULA_NUMBER_TYPE,
+    }
+)
+
+
+def _default_enabled_formula_types() -> tuple[str, ...]:
+    raw = os.getenv(
+        "TORVEX_FORMULA_TYPES",
+        ",".join(
+            (
+                _DISPLAY_FORMULA_TYPE,
+                _INLINE_FORMULA_TYPE,
+                _FORMULA_NUMBER_TYPE,
+            )
+        ),
+    )
+
+    values = tuple(
+        value.strip()
+        for value in raw.split(",")
+        if value.strip()
+    )
+
+    selected = tuple(
+        value
+        for value in values
+        if value in _ALLOWED_FORMULA_TYPES
+    )
+
+    return selected or (
+        _DISPLAY_FORMULA_TYPE,
+        _INLINE_FORMULA_TYPE,
+        _FORMULA_NUMBER_TYPE,
+    )
+
+
 @dataclass(frozen=True)
 class FormulaExtractionConfig:
     model_name: str = "breezedeus/pix2text-mfr-1.5"
-    enabled_formula_types: tuple[str, ...] = ("display_formula",)
+    enabled_formula_types: tuple[str, ...] = field(default_factory=_default_enabled_formula_types)
     accept_confidence: float = 0.75
     low_confidence: float = 0.55
     padding_ratio: float = 0.04
