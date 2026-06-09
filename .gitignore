@@ -11,6 +11,9 @@ models/
 # Local outputs
 outputs/
 results/
+docs/
+
+build_engine_code_review_bundle.py
 
 torvex_extract_code_review_bundle.md
 test_docs/
@@ -18,3 +21,5 @@ results/smoke/
 
 models/
 
+# Local patch backups
+*.bak_*
