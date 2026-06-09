@@ -8,6 +8,7 @@ Runs fast routing signals:
 - optional render for OCR / spotlight
 """
 import time
+import os
 
 import logging
 
@@ -825,6 +826,11 @@ def _process_single_page(
     page_height = 0.0
     effective_page_width_pt = 612.0
     effective_page_height_pt = 792.0
+    effective_render_dpi = RENDER_DPI
+    render_max_long_side_px = int(os.getenv("TORVEX_RENDER_MAX_LONG_SIDE_PX", "4000"))
+    render_w_px = 0
+    render_h_px = 0
+    render_downscaled = False
 
     try:
         t0 = time.perf_counter()
@@ -855,13 +861,36 @@ def _process_single_page(
             _record_timing("detect_table_fast", t0)
 
         t0 = time.perf_counter()
-        scale = RENDER_DPI / 72.0
+
+        # 2026-06-10: Experimental dynamic render cap for oversized scanned pages.
+        #
+        # Default is OFF: TORVEX_RENDER_MAX_LONG_SIDE_PX=0.
+        # When enabled, huge pages are rendered below 200 DPI so the rendered
+        # raster does not explode RAM/latency. Coordinate math must use
+        # effective_render_dpi, not global RENDER_DPI.
+        effective_render_dpi = RENDER_DPI
+        render_downscaled = False
+
+        if render_max_long_side_px > 0:
+            longest_page_pt = max(float(page_width), float(page_height), 1.0)
+            estimated_long_side_px = longest_page_pt * (RENDER_DPI / 72.0)
+
+            if estimated_long_side_px > render_max_long_side_px:
+                effective_render_dpi = max(
+                    72.0,
+                    render_max_long_side_px * 72.0 / longest_page_pt,
+                )
+                render_downscaled = True
+
+        scale = effective_render_dpi / 72.0
         image = page_obj.render(scale=scale).to_pil().convert("RGB")
         img_np = np.array(image)
 
         img_h_px, img_w_px = img_np.shape[:2]
-        effective_page_width_pt = img_w_px * (72.0 / RENDER_DPI)
-        effective_page_height_pt = img_h_px * (72.0 / RENDER_DPI)
+        render_w_px = int(img_w_px)
+        render_h_px = int(img_h_px)
+        effective_page_width_pt = img_w_px * (72.0 / effective_render_dpi)
+        effective_page_height_pt = img_h_px * (72.0 / effective_render_dpi)
         _record_timing("render", t0)
 
     except Exception as exc:
@@ -890,6 +919,7 @@ def _process_single_page(
         "page_height": page_height,
         "effective_page_width_pt": effective_page_width_pt,
         "effective_page_height_pt": effective_page_height_pt,
+        "render_dpi": effective_render_dpi,
         "image": image,
         "img_np": img_np,
         "has_bordered_table": has_bordered_table,
@@ -902,6 +932,12 @@ def _process_single_page(
         "metadata": {
             "ocr_probe_len": len(probe_text),
             "ocr_reason": ocr_reason,
+            "render_dpi": effective_render_dpi,
+            "render_base_dpi": RENDER_DPI,
+            "render_max_long_side_px": render_max_long_side_px,
+            "render_downscaled": render_downscaled,
+            "render_w_px": render_w_px,
+            "render_h_px": render_h_px,
             "timings_ms": timings_ms,
         },
         "layout_grade": "",

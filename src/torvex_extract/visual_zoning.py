@@ -335,6 +335,11 @@ def attach_zone_bboxes(
     page_width_pt = page["effective_page_width_pt"]
     page_height_pt = page["effective_page_height_pt"]
 
+    # 2026-06-10: Dynamic render cap support.
+    # If pypdfium_extractor rendered an oversized page below base RENDER_DPI,
+    # bbox conversion must use that per-page effective render DPI.
+    render_dpi = float(page.get("render_dpi", RENDER_DPI) or RENDER_DPI)
+
     for zone in zones:
         if "bbox" not in zone:
             logger.warning(
@@ -350,7 +355,7 @@ def attach_zone_bboxes(
         zone["bbox_pdfium"] = list(
             image_bbox_to_pdfium_coords(
                 bbox_px=bbox_px,
-                render_dpi=RENDER_DPI,
+                render_dpi=render_dpi,
                 page_width_pt=page_width_pt,
                 page_height_pt=page_height_pt,
             )
@@ -359,7 +364,7 @@ def attach_zone_bboxes(
         zone["bbox_plumber"] = list(
             image_bbox_to_plumber_coords(
                 bbox_px=bbox_px,
-                render_dpi=RENDER_DPI,
+                render_dpi=render_dpi,
                 page_width_pt=page_width_pt,
                 page_height_pt=page_height_pt,
             )
@@ -1495,11 +1500,34 @@ class TorvexExtractEngine:
         if self._ocr_backend == "onnxtr_fast_base":
             image_h, image_w = image_np.shape[:2]
 
+            # 2026-06-10: Cap oversized OCR input for scanned pages.
+            #
+            # Large rendered pages can exceed 35-40MP. Passing those directly
+            # into ONNXTR causes temporary multi-GB RAM spikes and slow OCR.
+            # Keep the original rendered image for layout/table coordinates,
+            # but downscale only the temporary OCR image.
+            #
+            # TORVEX_OCR_MAX_LONG_SIDE_PX=0 disables this cap.
+            max_ocr_long_side_px = int(os.getenv("TORVEX_OCR_MAX_LONG_SIDE_PX", "2500"))
+            ocr_image_np = image_np
+
+            if max_ocr_long_side_px > 0:
+                long_side = max(image_w, image_h)
+                if long_side > max_ocr_long_side_px:
+                    scale = max_ocr_long_side_px / float(long_side)
+                    ocr_w = max(1, int(round(image_w * scale)))
+                    ocr_h = max(1, int(round(image_h * scale)))
+
+                    resampling = getattr(Image, "Resampling", Image).LANCZOS
+                    ocr_image_np = np.asarray(
+                        Image.fromarray(image_np).resize((ocr_w, ocr_h), resampling)
+                    )
+
             # ONNXTR stable public path is image file input.
             # This is experiment-only for now, not production-final.
             with tempfile.TemporaryDirectory() as tmpdir:
                 image_path = Path(tmpdir) / "ocr_input.png"
-                Image.fromarray(image_np).save(image_path)
+                Image.fromarray(ocr_image_np).save(image_path)
 
                 from onnxtr.io import DocumentFile
 
