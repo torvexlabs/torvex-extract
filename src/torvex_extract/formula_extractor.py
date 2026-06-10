@@ -6,6 +6,7 @@ import gc
 import logging
 import math
 import os
+from pathlib import Path
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -68,16 +69,10 @@ _ALLOWED_FORMULA_TYPES = frozenset(
 
 
 def _default_enabled_formula_types() -> tuple[str, ...]:
-    raw = os.getenv(
-        "TORVEX_FORMULA_TYPES",
-        ",".join(
-            (
-                _DISPLAY_FORMULA_TYPE,
-                _INLINE_FORMULA_TYPE,
-                _FORMULA_NUMBER_TYPE,
-            )
-        ),
-    )
+    # Benchmark/prod default:
+    # Display formulas are the only formula class currently exported/scored safely.
+    # Inline formulas and formula_number remain opt-in through TORVEX_FORMULA_TYPES.
+    raw = os.getenv("TORVEX_FORMULA_TYPES", _DISPLAY_FORMULA_TYPE)
 
     values = tuple(
         value.strip()
@@ -91,11 +86,47 @@ def _default_enabled_formula_types() -> tuple[str, ...]:
         if value in _ALLOWED_FORMULA_TYPES
     )
 
-    return selected or (
-        _DISPLAY_FORMULA_TYPE,
-        _INLINE_FORMULA_TYPE,
-        _FORMULA_NUMBER_TYPE,
-    )
+    return selected or (_DISPLAY_FORMULA_TYPE,)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+
+    return default
+
+
+def _env_int(name: str, default: int, *, min_value: int, max_value: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+
+    try:
+        value = int(raw)
+    except Exception:
+        return default
+
+    return max(min_value, min(max_value, value))
+
+
+def _env_float(name: str, default: float, *, min_value: float, max_value: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+
+    try:
+        value = float(raw)
+    except Exception:
+        return default
+
+    return max(min_value, min(max_value, value))
 
 
 @dataclass(frozen=True)
@@ -104,15 +135,16 @@ class FormulaExtractionConfig:
     enabled_formula_types: tuple[str, ...] = field(default_factory=_default_enabled_formula_types)
     accept_confidence: float = 0.75
     low_confidence: float = 0.55
-    padding_ratio: float = 0.04
-    min_padding_px: int = 6
-    white_border_px: int = 12
+    padding_ratio: float = field(default_factory=lambda: _env_float("TORVEX_FORMULA_PADDING_RATIO", 0.01, min_value=0.0, max_value=0.20))
+    min_padding_px: int = field(default_factory=lambda: _env_int("TORVEX_FORMULA_MIN_PADDING_PX", 2, min_value=0, max_value=64))
+    white_border_px: int = field(default_factory=lambda: _env_int("TORVEX_FORMULA_WHITE_BORDER_PX", 8, min_value=0, max_value=64))
     min_crop_width_px: int = 8
     min_crop_height_px: int = 8
     blank_dark_ratio_threshold: float = 0.0005
-    enable_self_consensus: bool = True
+    enable_self_consensus: bool = field(default_factory=lambda: _env_bool("TORVEX_FORMULA_SELF_CONSENSUS", False))
     consensus_padding_ratio: float = 0.08
     consensus_similarity_threshold: float = 0.92
+    max_new_tokens: int = field(default_factory=lambda: _env_int("TORVEX_FORMULA_MAX_NEW_TOKENS", 256, min_value=16, max_value=256))
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -295,6 +327,93 @@ def _balanced(text: str, left: str, right: str) -> bool:
     return depth == 0
 
 
+def _debug_save_formula_crop(
+    crop: Image.Image,
+    *,
+    formula_id: str,
+    formula_type: str,
+) -> str:
+    out_dir = os.getenv("TORVEX_FORMULA_CROP_DEBUG_DIR")
+    if not out_dir:
+        return ""
+
+    try:
+        root = Path(out_dir)
+        root.mkdir(parents=True, exist_ok=True)
+
+        safe_id = "".join(
+            ch if ch.isalnum() or ch in {"_", "-"} else "_"
+            for ch in str(formula_id or "formula")
+        )
+        safe_type = "".join(
+            ch if ch.isalnum() or ch in {"_", "-"} else "_"
+            for ch in str(formula_type or "unknown")
+        )
+
+        out_path = root / f"{safe_id}_{safe_type}.png"
+        crop.save(out_path)
+        return str(out_path)
+    except Exception as exc:
+        return f"crop_debug_save_failed:{exc}"
+
+
+_ALLOWED_SINGLE_CHAR_LATEX_COMMANDS = frozenset(
+    {
+        "\\",  # row break: \\
+        ",",  # thin space: \,
+        ";",
+        ":",
+        "!",
+        "_",
+        "#",
+        "%",
+        "&",
+        "$",
+        "{",
+        "}",
+        "[",
+        "]",
+        "(",
+        ")",
+        "|",
+        "~",
+    }
+)
+
+
+def _has_broken_latex_command(text: str) -> bool:
+    index = 0
+    length = len(text)
+
+    while index < length:
+        if text[index] != "\\":
+            index += 1
+            continue
+
+        if index + 1 >= length:
+            return True
+
+        next_char = text[index + 1]
+
+        # Standard LaTeX command: \frac, \left, \right, \begin, etc.
+        if next_char.isalpha():
+            cursor = index + 2
+            while cursor < length and text[cursor].isalpha():
+                cursor += 1
+            index = cursor
+            continue
+
+        # Common valid one-character LaTeX commands:
+        # \\, \,, \;, \:, \!, \#, \_, \%, \&, \{, \}, etc.
+        if next_char in _ALLOWED_SINGLE_CHAR_LATEX_COMMANDS or next_char.isspace():
+            index += 2
+            continue
+
+        return True
+
+    return False
+
+
 def validate_latex(latex: str, formula_type: str) -> tuple[bool, str]:
     text = (latex or "").strip()
 
@@ -319,7 +438,7 @@ def validate_latex(latex: str, formula_type: str) -> tuple[bool, str]:
     if not _balanced(text, "(", ")"):
         return False, "unbalanced_parentheses"
 
-    if _BROKEN_COMMAND_RE.search(text):
+    if _has_broken_latex_command(text):
         return False, "broken_latex_command"
 
     # Inline formulas can legitimately be tiny: r, x, EPS, P/E, etc.
@@ -390,6 +509,31 @@ def _text_similarity(left: str, right: str) -> float:
     return SequenceMatcher(None, left_clean, right_clean).ratio()
 
 
+def _default_formula_model_dir() -> str:
+    env_value = os.getenv("TORVEX_FORMULA_MODEL_DIR")
+    if env_value:
+        return env_value
+
+    model_rel = Path("models") / "pix2text-mfr-1.5"
+
+    candidates: list[Path] = [
+        Path.cwd() / model_rel,
+    ]
+
+    # Important for editable installs:
+    # C:\torvex-extract\src\torvex_extract\formula_extractor.py
+    # -> C:\torvex-extract\models\pix2text-mfr-1.5
+    for parent in Path(__file__).resolve().parents:
+        candidates.append(parent / model_rel)
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+
+    # Final fallback keeps old behavior.
+    return str(model_rel)
+
+
 class FormulaMfrExtractor:
     """
     Optional Pix2Text-MFR ONNX formula recognizer.
@@ -420,7 +564,7 @@ class FormulaMfrExtractor:
             return
 
         self._ocr = PureOnnxMfr(
-            model_dir=os.getenv("TORVEX_FORMULA_MODEL_DIR") or "models/pix2text-mfr-1.5",
+            model_dir=_default_formula_model_dir(),
             device=self.device,
         )
 
@@ -436,7 +580,7 @@ class FormulaMfrExtractor:
 
         return self._ocr.recognize(
             crop,
-            max_new_tokens=128,
+            max_new_tokens=self.config.max_new_tokens,
         )
 
     def _maybe_run_self_consensus(
@@ -516,6 +660,7 @@ class FormulaMfrExtractor:
                 "bbox_pdfium": formula.get("bbox_pdfium"),
                 "bbox_plumber": formula.get("bbox_plumber"),
                 "crop_bbox_px": None,
+                "crop_debug_path": "",
                 "layout_score": _safe_float(formula.get("score"), 0.0),
                 "fallback_text": "",
                 "validation_error": "",
@@ -569,6 +714,14 @@ class FormulaMfrExtractor:
                 artifact["status"] = "crop_empty"
                 artifacts.append(artifact)
                 continue
+
+            crop_debug_path = _debug_save_formula_crop(
+                crop,
+                formula_id=formula_id,
+                formula_type=formula_type,
+            )
+            if crop_debug_path:
+                artifact["crop_debug_path"] = crop_debug_path
 
             try:
                 recognized = self.recognize_crop(crop)
