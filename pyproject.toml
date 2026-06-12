@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 formula = [
+    "ftfy>=6.3.1",
     "tokenizers>=0.15.0",
 ]
 
