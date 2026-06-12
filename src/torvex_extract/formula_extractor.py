@@ -1,5 +1,15 @@
 from __future__ import annotations
 
+# 2026-06-11 unimernet engine swap:
+# TORVEX_FORMULA_ENGINE=unimernet routes to PyTorchUnimernetMfr;
+# anything else keeps PureOnnxMfr (pix2text int8, default).
+try:
+    from torvex_extract.pytorch_unimernet_mfr import PyTorchUnimernetMfr as _PyTorchUnimernetMfr
+    _UNIMERNET_AVAILABLE = True
+except ImportError:
+    _PyTorchUnimernetMfr = None  # type: ignore[assignment,misc]
+    _UNIMERNET_AVAILABLE = False
+
 from torvex_extract.pure_onnx_mfr import PureOnnxMfr
 
 import gc
@@ -144,7 +154,29 @@ class FormulaExtractionConfig:
     enable_self_consensus: bool = field(default_factory=lambda: _env_bool("TORVEX_FORMULA_SELF_CONSENSUS", False))
     consensus_padding_ratio: float = 0.08
     consensus_similarity_threshold: float = 0.92
-    max_new_tokens: int = field(default_factory=lambda: _env_int("TORVEX_FORMULA_MAX_NEW_TOKENS", 256, min_value=16, max_value=256))
+    # 2026-06-11: ceiling raised 384 -> 1024 to match the model's own
+    # generation_config.json (max_new_tokens=1024). run_043 proved the old
+    # ceiling silently clamped an env setting of 512 back to 384, leaving 18
+    # formulas truncated. DEFAULT stays 384: longer decode = quadratic
+    # latency cost, opt in per run via TORVEX_FORMULA_MAX_NEW_TOKENS.
+    max_new_tokens: int = field(default_factory=lambda: _env_int("TORVEX_FORMULA_MAX_NEW_TOKENS", 384, min_value=16, max_value=1024))
+
+    # 2026-06-11 display-formula splitter:
+    # PP-DocLayoutV3 frequently emits ONE display_formula box covering a
+    # vertical stack of SEPARATE equations (measured on OmniDocBench
+    # equation_hard, 30 pages: 58 of 155 display zones contained 2-10 GT
+    # equations each). Merged crops force the MFR to decode multiple
+    # equations in one pass, blowing the token budget -> truncation ->
+    # invalid_latex -> every covered GT equation scores zero. We split each
+    # display_formula bbox at full-width horizontal white gaps BEFORE
+    # cropping/MFR. A gap is a boundary only if it is >= split_min_gap_px
+    # AND >= split_gap_ratio * the smallest substantial content-run height
+    # (~one text line). Matrices self-protect: bracket verticals ink every
+    # row, so they produce no blank runs at all (verified on debug crops).
+    enable_display_split: bool = field(default_factory=lambda: _env_bool("TORVEX_FORMULA_SPLIT", True))
+    split_min_gap_px: int = field(default_factory=lambda: _env_int("TORVEX_FORMULA_SPLIT_MIN_GAP_PX", 12, min_value=4, max_value=200))
+    split_gap_ratio: float = field(default_factory=lambda: _env_float("TORVEX_FORMULA_SPLIT_GAP_RATIO", 0.35, min_value=0.05, max_value=2.0))
+    split_max_segments: int = field(default_factory=lambda: _env_int("TORVEX_FORMULA_SPLIT_MAX_SEGMENTS", 12, min_value=2, max_value=64))
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -301,6 +333,167 @@ def _crop_formula_image(
     )
 
     return crop, crop_bbox
+
+
+# --- 2026-06-11 display-formula splitter -----------------------------------
+# See FormulaExtractionConfig comment for the why. Pure numpy, deterministic,
+# no model involved: scan the bbox region row-by-row, find full-width blank
+# (near-white) horizontal gap runs, and cut the bbox at gaps that are tall
+# enough to be equation boundaries rather than intra-equation spacing.
+
+
+def _horizontal_white_gap_segments(
+    page_image: Image.Image,
+    bbox_px: list[float],
+    config: FormulaExtractionConfig,
+) -> list[tuple[float, float]]:
+    """
+    Return [(y0, y1), ...] page-pixel row spans, one per detected equation.
+
+    Returns a single span (= no split) whenever anything looks risky:
+    degenerate crop, single content block, no qualifying gap, or more cuts
+    than split_max_segments (a wall of tiny gaps usually means a matrix or
+    dotted structure we must not cut).
+    """
+    whole = [(float(bbox_px[1]), float(bbox_px[3]))]
+
+    x0 = max(0, int(math.floor(bbox_px[0])))
+    y0 = max(0, int(math.floor(bbox_px[1])))
+    x1 = min(page_image.size[0], int(math.ceil(bbox_px[2])))
+    y1 = min(page_image.size[1], int(math.ceil(bbox_px[3])))
+
+    if (x1 - x0) < config.min_crop_width_px or (y1 - y0) < config.min_crop_height_px:
+        return whole
+
+    gray = np.asarray(page_image.crop((x0, y0, x1, y1)).convert("L"))
+    if gray.size == 0:
+        return whole
+
+    height, width = gray.shape
+    dark_per_row = (gray < 245).sum(axis=1)
+
+    # A "blank" row tolerates a few dark pixels (scan noise, bleed-through)
+    # but NOT a \vdots / \ddots row, which carries visibly more ink.
+    blank_row_max_dark = max(1, int(width * 0.004))
+    is_blank = dark_per_row <= blank_row_max_dark
+
+    # Run-length encode rows into alternating blank/content runs.
+    runs: list[tuple[int, int, bool]] = []
+    start = 0
+    for row in range(1, height + 1):
+        if row == height or bool(is_blank[row]) != bool(is_blank[start]):
+            runs.append((start, row, bool(is_blank[start])))
+            start = row
+
+    content_runs = [(s, e) for s, e, blank in runs if not blank]
+    if len(content_runs) <= 1:
+        return whole
+
+    # 2026-06-11 threshold calibration (measured on run_042 debug crops):
+    # equation boundaries are 16-18px blank runs, scan noise is 1-5px, and
+    # matrices produce ZERO blank runs (bracket verticals ink every row, so
+    # they self-protect). Ratio is anchored to the SMALLEST substantial
+    # content run (~one text line height), NOT the median: fraction-heavy
+    # equations produce 120px+ content runs that inflate the median and
+    # push the threshold past real boundaries.
+    substantial = [e - s for s, e in content_runs if (e - s) >= 8]
+    line_h = min(substantial) if substantial else min(e - s for s, e in content_runs)
+    min_gap = max(float(config.split_min_gap_px), line_h * config.split_gap_ratio)
+
+    # Interior blank runs tall enough to be equation boundaries.
+    cut_rows: list[int] = []
+    for s, e, blank in runs:
+        if not blank or s == 0 or e == height:
+            continue
+        if (e - s) >= min_gap:
+            cut_rows.append((s + e) // 2)
+
+    if not cut_rows:
+        return whole
+
+    if len(cut_rows) + 1 > config.split_max_segments:
+        # Too many cuts is a red flag (dense dotted/matrix structure).
+        # Refuse to split rather than shred a single tall equation.
+        return whole
+
+    # Build segments between cuts, then tighten each to its own content
+    # extents (+2px pad) so MFR crops stay snug.
+    segments: list[tuple[float, float]] = []
+    boundaries = [0] + cut_rows + [height]
+    for seg_start, seg_end in zip(boundaries[:-1], boundaries[1:]):
+        seg_blank = is_blank[seg_start:seg_end]
+        rows_with_ink = [
+            seg_start + offset
+            for offset, blank in enumerate(seg_blank)
+            if not blank
+        ]
+        if not rows_with_ink:
+            continue
+        top = max(seg_start, rows_with_ink[0] - 2)
+        bottom = min(seg_end, rows_with_ink[-1] + 3)
+        if (bottom - top) < config.min_crop_height_px:
+            continue
+        segments.append((float(y0 + top), float(y0 + bottom)))
+
+    if len(segments) <= 1:
+        return whole
+
+    return segments
+
+
+def _split_display_formula_bboxes(
+    page_image: Image.Image,
+    formula_bboxes: list[dict[str, Any]],
+    config: FormulaExtractionConfig,
+) -> list[dict[str, Any]]:
+    """
+    2026-06-11 display-formula splitter entry point.
+
+    Expands merged display_formula bboxes into one bbox per equation.
+    Non-display formulas and unsplittable boxes pass through unchanged.
+    Children inherit the parent dict (type, score, ...) but get their own
+    bbox_px, a derived formula_id "<parent>_s<i>", a "split_from" tag for
+    traceability, and None pdfium/plumber boxes (only the parent zone had
+    coordinates in those spaces; the exporter keys off bbox_px).
+    """
+    if not config.enable_display_split:
+        return list(formula_bboxes or [])
+
+    expanded: list[dict[str, Any]] = []
+
+    for formula in formula_bboxes or []:
+        if str(formula.get("type") or "") != _DISPLAY_FORMULA_TYPE:
+            expanded.append(formula)
+            continue
+
+        bbox_px = _extract_bbox_px(formula)
+        if bbox_px is None:
+            expanded.append(formula)
+            continue
+
+        segments = _horizontal_white_gap_segments(page_image, bbox_px, config)
+        if len(segments) <= 1:
+            expanded.append(formula)
+            continue
+
+        parent_id = str(formula.get("formula_id") or "formula")
+        for seg_index, (seg_y0, seg_y1) in enumerate(segments):
+            child = dict(formula)
+            child["bbox_px"] = [bbox_px[0], seg_y0, bbox_px[2], seg_y1]
+            child["formula_id"] = f"{parent_id}_s{seg_index}"
+            child["bbox_pdfium"] = None
+            child["bbox_plumber"] = None
+            child["split_from"] = parent_id
+            expanded.append(child)
+
+        logger.debug(
+            "display-formula split: %s -> %d segments", parent_id, len(segments)
+        )
+
+    return expanded
+
+
+# --- end 2026-06-11 display-formula splitter --------------------------------
 
 
 def _balanced(text: str, left: str, right: str) -> bool:
@@ -460,6 +653,109 @@ def validate_latex(latex: str, formula_type: str) -> tuple[bool, str]:
     return True, ""
 
 
+# --- 2026-06-11 formula salvage ---------------------------------------------
+# run_043: 56 invalid_latex formulas (18 truncations at the token cap, 23
+# repeated-garbage decode loops, ~15 recognition errors) were dropped by the
+# exporter, scoring 0 for their GT formulas. Most are partially correct; a
+# repaired prefix scores far better than an empty prediction under both edit
+# distance and CDM (a balanced prefix usually still renders). Repair instead
+# of reject.
+
+_TRAILING_HALF_COMMAND_RE = re.compile(r"\\[A-Za-z]*$")
+_BEGIN_ENV_RE = re.compile(r"\\begin\{([A-Za-z*]+)\}")
+_END_ENV_RE = re.compile(r"\\end\{([A-Za-z*]+)\}")
+
+
+def _cut_repeated_garbage(text: str) -> str:
+    """Keep everything up to and including ONE cycle of a detected repeat."""
+    match = _REPEATED_GARBAGE_RE.search(text)
+    if not match:
+        return text
+    return text[: match.start() + len(match.group(1))]
+
+
+def _trim_to_balanced_prefix(text: str) -> str:
+    """
+    Longest prefix where {}, [] and () are all simultaneously balanced.
+    Escaped delimiters (\\{ etc.) are ignored, matching _balanced().
+    """
+    best_end = 0
+    braces = brackets = parens = 0
+    escaped = False
+
+    for index, char in enumerate(text):
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == "{":
+            braces += 1
+        elif char == "}":
+            braces -= 1
+        elif char == "[":
+            brackets += 1
+        elif char == "]":
+            brackets -= 1
+        elif char == "(":
+            parens += 1
+        elif char == ")":
+            parens -= 1
+
+        if braces < 0 or brackets < 0 or parens < 0:
+            break
+
+        if braces == 0 and brackets == 0 and parens == 0 and not escaped:
+            best_end = index + 1
+
+    return text[:best_end].rstrip()
+
+
+def _close_open_environments(text: str) -> str:
+    """Append \\end{env} for every \\begin{env} left open (LIFO order)."""
+    stack: list[str] = []
+    events = sorted(
+        [(m.start(), "begin", m.group(1)) for m in _BEGIN_ENV_RE.finditer(text)]
+        + [(m.start(), "end", m.group(1)) for m in _END_ENV_RE.finditer(text)]
+    )
+    for _, kind, name in events:
+        if kind == "begin":
+            stack.append(name)
+        elif stack and stack[-1] == name:
+            stack.pop()
+
+    for name in reversed(stack):
+        text += " \\end{" + name + "}"
+
+    return text
+
+
+def _salvage_latex(latex: str, formula_type: str) -> str:
+    """
+    Repair pipeline for LaTeX that failed validate_latex(). Returns the
+    repaired string if it now validates, else "" (caller keeps old behavior).
+    """
+    text = (latex or "").strip()
+    if not text:
+        return ""
+
+    text = _cut_repeated_garbage(text)
+    text = _TRAILING_HALF_COMMAND_RE.sub("", text).rstrip()
+    text = _trim_to_balanced_prefix(text)
+    if not text:
+        return ""
+
+    text = _close_open_environments(text)
+
+    is_valid, _ = validate_latex(text, formula_type)
+    if not is_valid:
+        return ""
+
+    return text
+
+
+# --- end 2026-06-11 formula salvage ------------------------------------------
+
+
 def _join_ocr_segments(segments: list[dict[str, Any]]) -> str:
     if not segments:
         return ""
@@ -563,10 +859,32 @@ class FormulaMfrExtractor:
         if self._ocr is not None:
             return
 
-        self._ocr = PureOnnxMfr(
-            model_dir=_default_formula_model_dir(),
-            device=self.device,
-        )
+        # 2026-06-11 unimernet engine swap
+        _engine_name = os.getenv("TORVEX_FORMULA_ENGINE", "pix2text").strip().lower()
+        if _engine_name == "unimernet" and _UNIMERNET_AVAILABLE:
+            logger.info("Formula engine: UniMERNet (pytorch_unimernet_mfr)")
+            self._ocr = _PyTorchUnimernetMfr(
+                model_dir=os.getenv(
+                    "TORVEX_FORMULA_MODEL_DIR",
+                    str(Path(_default_formula_model_dir()).parent / "unimernet-tiny"),
+                ),
+                device=self.device,
+            )
+        elif _engine_name == "unimernet" and not _UNIMERNET_AVAILABLE:
+            logger.warning(
+                "TORVEX_FORMULA_ENGINE=unimernet but pytorch_unimernet_mfr is not "
+                "importable. Falling back to pix2text."
+            )
+            self._ocr = PureOnnxMfr(
+                model_dir=_default_formula_model_dir(),
+                device=self.device,
+            )
+        else:
+            logger.info("Formula engine: pix2text (pure_onnx_mfr)")
+            self._ocr = PureOnnxMfr(
+                model_dir=_default_formula_model_dir(),
+                device=self.device,
+            )
 
         logger.info(
             "Loaded pure ONNX MFR model: device=%s",
@@ -641,6 +959,14 @@ class FormulaMfrExtractor:
             return []
 
         artifacts: list[dict[str, Any]] = []
+
+        # 2026-06-11 display-formula splitter: expand merged PP-DocLayoutV3
+        # display boxes into one bbox per equation BEFORE cropping/MFR.
+        formula_bboxes = _split_display_formula_bboxes(
+            page_image,
+            list(formula_bboxes or []),
+            self.config,
+        )
 
         for index, formula in enumerate(formula_bboxes or []):
             formula_type = str(formula.get("type") or "unknown").strip()
@@ -748,6 +1074,19 @@ class FormulaMfrExtractor:
             artifact["confidence"] = confidence
 
             is_valid, validation_error = validate_latex(latex, formula_type)
+
+            # 2026-06-11 formula salvage: repair instead of reject. A
+            # truncated/garbled output that trims to a valid prefix is worth
+            # far more than an empty prediction (see patch header).
+            if not is_valid:
+                salvaged = _salvage_latex(latex, formula_type)
+                if salvaged:
+                    artifact["latex"] = salvaged
+                    artifact["quality_flags"].append(
+                        f"salvaged:{validation_error}"
+                    )
+                    latex = salvaged
+                    is_valid, validation_error = True, ""
 
             if not is_valid:
                 artifact["status"] = "invalid_latex"

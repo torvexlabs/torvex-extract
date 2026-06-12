@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import math
@@ -9,6 +9,32 @@ from typing import Any
 import numpy as np
 import onnxruntime as ort
 from PIL import Image
+
+
+# 2026-06-11 formula salvage / speed support.
+# Greedy decoding can lock into a short token cycle on hard crops (run_043:
+# 23 of 56 invalid formulas were "repeated_garbage" that burned the full
+# token budget). Detect the cycle and stop early: the salvage step in
+# formula_extractor keeps one cycle and repairs the rest. Thresholds are
+# conservative because legitimate LaTeX repeats tokens (e.g. "}}}}}}" when
+# closing deep nesting): period 1 needs 20 repeats, periods 2-10 need 8.
+
+
+def _has_token_cycle(generated: list[int]) -> bool:
+    n = len(generated)
+
+    for period in range(1, 11):
+        repeats = 20 if period == 1 else 8
+        span = period * repeats
+        if n < span:
+            continue
+
+        tail = generated[-span:]
+        block = tail[:period]
+        if all(tail[i] == block[i % period] for i in range(span)):
+            return True
+
+    return False
 
 
 class PureOnnxMfr:
@@ -34,8 +60,19 @@ class PureOnnxMfr:
             str(self.model_dir / "encoder_model.onnx"),
             providers=providers,
         )
+        # 2026-06-11: opt-in int8 decoder for CPU dev iteration (~2-3x decode
+        # speedup typical). Created once via onnxruntime.quantization
+        # quantize_dynamic (see patch_20260611_formula_salvage_speed.py
+        # header). MUST be A/B-validated against fp32 on the 30-page proxy;
+        # canonical runs stay fp32 unless the accuracy delta is negligible.
+        decoder_name = "decoder_model.onnx"
+        if os.getenv("TORVEX_FORMULA_INT8", "1").strip().lower() in {"1", "true", "yes", "on"}:
+            int8_path = self.model_dir / "decoder_model_int8.onnx"
+            if int8_path.exists():
+                decoder_name = "decoder_model_int8.onnx"
+
         self.decoder = ort.InferenceSession(
-            str(self.model_dir / "decoder_model.onnx"),
+            str(self.model_dir / decoder_name),
             providers=providers,
         )
 
@@ -121,6 +158,12 @@ class PureOnnxMfr:
 
                 if math.isfinite(prob) and prob > 0:
                     token_probs.append(prob)
+
+                # 2026-06-11: stop decoding when the output locks into a
+                # repeating token cycle -- the rest of the budget would only
+                # produce garbage; salvage repairs what we keep.
+                if _has_token_cycle(generated):
+                    break
 
             input_ids = np.concatenate(
                 [input_ids, np.array([[next_id]], dtype=np.int64)],
