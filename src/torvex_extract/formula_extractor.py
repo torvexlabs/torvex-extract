@@ -1,16 +1,8 @@
 from __future__ import annotations
 
-# 2026-06-11 unimernet engine swap:
-# TORVEX_FORMULA_ENGINE=unimernet routes to PyTorchUnimernetMfr;
-# anything else keeps PureOnnxMfr (pix2text int8, default).
-try:
-    from torvex_extract.pytorch_unimernet_mfr import PyTorchUnimernetMfr as _PyTorchUnimernetMfr
-    _UNIMERNET_AVAILABLE = True
-except ImportError:
-    _PyTorchUnimernetMfr = None  # type: ignore[assignment,misc]
-    _UNIMERNET_AVAILABLE = False
-
 from torvex_extract.pure_onnx_mfr import PureOnnxMfr
+from torvex_extract.pure_onnx_unimernet import MAX_NEW_TOKENS as UNIMERNET_MAX_NEW_TOKENS
+from torvex_extract.pure_onnx_unimernet import OnnxUnimerNet
 
 import gc
 import logging
@@ -154,12 +146,11 @@ class FormulaExtractionConfig:
     enable_self_consensus: bool = field(default_factory=lambda: _env_bool("TORVEX_FORMULA_SELF_CONSENSUS", False))
     consensus_padding_ratio: float = 0.08
     consensus_similarity_threshold: float = 0.92
-    # 2026-06-11: ceiling raised 384 -> 1024 to match the model's own
-    # generation_config.json (max_new_tokens=1024). run_043 proved the old
-    # ceiling silently clamped an env setting of 512 back to 384, leaving 18
-    # formulas truncated. DEFAULT stays 384: longer decode = quadratic
-    # latency cost, opt in per run via TORVEX_FORMULA_MAX_NEW_TOKENS.
-    max_new_tokens: int = field(default_factory=lambda: _env_int("TORVEX_FORMULA_MAX_NEW_TOKENS", 384, min_value=16, max_value=1024))
+    # 2026-06-11: Pix2Text default stays 384 for latency, but the ceiling is
+    # high enough for UniMERNet ONNX's exported decoder limit. UniMERNet uses
+    # its full budget by default inside FormulaMfrExtractor unless this env is
+    # explicitly set.
+    max_new_tokens: int = field(default_factory=lambda: _env_int("TORVEX_FORMULA_MAX_NEW_TOKENS", 384, min_value=16, max_value=1534))
 
     # 2026-06-11 display-formula splitter:
     # PP-DocLayoutV3 frequently emits ONE display_formula box covering a
@@ -830,6 +821,26 @@ def _default_formula_model_dir() -> str:
     return str(model_rel)
 
 
+def _default_unimernet_onnx_root() -> Path:
+    env_value = os.getenv("TORVEX_UNIMERNET_ONNX_MODEL_DIR")
+    if env_value:
+        return Path(env_value)
+
+    model_rel = Path("models") / "unimernet-tiny-onnx"
+    candidates: list[Path] = [
+        Path.cwd() / model_rel,
+    ]
+
+    for parent in Path(__file__).resolve().parents:
+        candidates.append(parent / model_rel)
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    return model_rel
+
+
 class FormulaMfrExtractor:
     """
     Optional Pix2Text-MFR ONNX formula recognizer.
@@ -853,31 +864,56 @@ class FormulaMfrExtractor:
         self.device = (device or "cpu").strip().lower()
         self.config = config or FormulaExtractionConfig()
         self._ocr: Any | None = None
+        self._recognize_max_new_tokens = self.config.max_new_tokens
 
 
     def _ensure_loaded(self) -> None:
         if self._ocr is not None:
             return
 
-        # 2026-06-11 unimernet engine swap
-        _engine_name = os.getenv("TORVEX_FORMULA_ENGINE", "pix2text").strip().lower()
-        if _engine_name == "unimernet" and _UNIMERNET_AVAILABLE:
-            logger.info("Formula engine: UniMERNet (pytorch_unimernet_mfr)")
-            self._ocr = _PyTorchUnimernetMfr(
-                model_dir=os.getenv(
-                    "TORVEX_FORMULA_MODEL_DIR",
-                    str(Path(_default_formula_model_dir()).parent / "unimernet-tiny"),
-                ),
-                device=self.device,
-            )
-        elif _engine_name == "unimernet" and not _UNIMERNET_AVAILABLE:
+        engine_name = os.getenv("TORVEX_FORMULA_ENGINE", "pix2text").strip().lower()
+        if engine_name == "unimernet":
             logger.warning(
-                "TORVEX_FORMULA_ENGINE=unimernet but pytorch_unimernet_mfr is not "
-                "importable. Falling back to pix2text."
+                "TORVEX_FORMULA_ENGINE=unimernet is deprecated; using unimernet_onnx."
             )
-            self._ocr = PureOnnxMfr(
-                model_dir=_default_formula_model_dir(),
-                device=self.device,
+            engine_name = "unimernet_onnx"
+
+        self._recognize_max_new_tokens = self.config.max_new_tokens
+        if engine_name == "unimernet_onnx":
+            model_root = _default_unimernet_onnx_root()
+            artifacts_dir = Path(
+                os.getenv(
+                    "TORVEX_UNIMERNET_ONNX_ARTIFACTS_DIR",
+                    str(model_root / "artifacts"),
+                )
+            )
+            tokenizer_path = Path(
+                os.getenv(
+                    "TORVEX_UNIMERNET_TOKENIZER_DIR",
+                    str(model_root / "models" / "unimernet_tiny"),
+                )
+            )
+            providers = (
+                ["CUDAExecutionProvider", "CPUExecutionProvider"]
+                if self.device in {"gpu", "cuda"}
+                else ["CPUExecutionProvider"]
+            )
+            logger.info(
+                "Formula engine: unimernet_onnx artifacts=%s tokenizer=%s providers=%s",
+                artifacts_dir,
+                tokenizer_path,
+                providers,
+            )
+            self._recognize_max_new_tokens = (
+                self.config.max_new_tokens
+                if os.getenv("TORVEX_FORMULA_MAX_NEW_TOKENS") is not None
+                else UNIMERNET_MAX_NEW_TOKENS
+            )
+            self._ocr = OnnxUnimerNet(
+                artifacts_dir=artifacts_dir,
+                tokenizer_path=tokenizer_path,
+                providers=providers,
+                max_new_tokens=self._recognize_max_new_tokens,
             )
         else:
             logger.info("Formula engine: pix2text (pure_onnx_mfr)")
@@ -887,7 +923,8 @@ class FormulaMfrExtractor:
             )
 
         logger.info(
-            "Loaded pure ONNX MFR model: device=%s",
+            "Loaded formula MFR model: engine=%s device=%s",
+            engine_name,
             self.device,
         )
 
@@ -898,7 +935,7 @@ class FormulaMfrExtractor:
 
         return self._ocr.recognize(
             crop,
-            max_new_tokens=self.config.max_new_tokens,
+            max_new_tokens=self._recognize_max_new_tokens,
         )
 
     def _maybe_run_self_consensus(
