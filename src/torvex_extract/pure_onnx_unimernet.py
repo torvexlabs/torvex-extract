@@ -28,6 +28,9 @@ File layout expected:
 
 from __future__ import annotations
 
+import os
+import site
+
 import numpy as np
 import onnxruntime as ort
 from pathlib import Path
@@ -44,6 +47,110 @@ MEAN          = 0.7931
 STD           = 0.1738
 NUM_LAYERS    = 8
 MAX_NEW_TOKENS = 1534
+_DLL_DIRECTORY_HANDLES: list[Any] = []
+
+
+def _provider_name(provider: object) -> str:
+    if isinstance(provider, tuple) and provider:
+        return str(provider[0])
+    return str(provider)
+
+
+def _cuda_requested(providers: list[object]) -> bool:
+    return any(_provider_name(provider) == "CUDAExecutionProvider" for provider in providers)
+
+
+def _nvidia_bin_dirs() -> list[Path]:
+    roots: list[Path] = []
+
+    try:
+        import nvidia
+
+        roots.append(Path(nvidia.__file__).resolve().parent)
+    except Exception:
+        pass
+
+    for site_dir in site.getsitepackages():
+        roots.append(Path(site_dir) / "nvidia")
+
+    try:
+        roots.append(Path(site.getusersitepackages()) / "nvidia")
+    except Exception:
+        pass
+
+    component_order = (
+        "cudnn",
+        "cublas",
+        "cuda_runtime",
+        "cuda_nvrtc",
+        "cufft",
+        "curand",
+        "nvjitlink",
+    )
+
+    seen: set[Path] = set()
+    bin_dirs: list[Path] = []
+    for root in roots:
+        for component in component_order:
+            bin_dir = root / component / "bin"
+            if bin_dir.exists() and bin_dir not in seen:
+                seen.add(bin_dir)
+                bin_dirs.append(bin_dir)
+
+    return bin_dirs
+
+
+def _prepare_cuda_runtime(providers: list[object]) -> None:
+    if not _cuda_requested(providers):
+        return
+
+    if "CUDAExecutionProvider" not in ort.get_available_providers():
+        raise RuntimeError(
+            "CUDAExecutionProvider was requested, but this ONNX Runtime build does "
+            "not expose CUDA. Install onnxruntime-gpu[cuda,cudnn] or use CPU."
+        )
+
+    if os.name == "nt":
+        existing_path = os.environ.get("PATH", "")
+        existing_parts = set(existing_path.split(os.pathsep))
+        new_parts: list[str] = []
+
+        for bin_dir in _nvidia_bin_dirs():
+            bin_dir_str = str(bin_dir)
+            if hasattr(os, "add_dll_directory"):
+                try:
+                    _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(bin_dir_str))
+                except OSError:
+                    pass
+            if bin_dir_str not in existing_parts:
+                new_parts.append(bin_dir_str)
+
+        if new_parts:
+            os.environ["PATH"] = os.pathsep.join(new_parts + [existing_path])
+
+    preload_dlls = getattr(ort, "preload_dlls", None)
+    if preload_dlls is not None:
+        try:
+            preload_dlls(directory="")
+        except TypeError:
+            preload_dlls()
+
+
+def _disable_ort_fallback_if_cuda_requested(
+    providers: list[object],
+    sessions: list[ort.InferenceSession],
+) -> None:
+    if not _cuda_requested(providers):
+        return
+
+    for session in sessions:
+        if "CUDAExecutionProvider" not in session.get_providers():
+            raise RuntimeError(
+                "CUDAExecutionProvider was requested, but ONNX Runtime did not "
+                "activate it for the UniMERNet session."
+            )
+        if hasattr(session, "disable_fallback"):
+            session.disable_fallback()
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +271,7 @@ class OnnxUnimerNet:
 
         if providers is None:
             providers = ["CPUExecutionProvider"]
+        _prepare_cuda_runtime(providers)
 
         # Load ONNX sessions
         enc_path      = artifacts_dir / "encoder_model.onnx"
@@ -177,6 +285,10 @@ class OnnxUnimerNet:
         self._enc_sess      = ort.InferenceSession(str(enc_path),      opts, providers=providers)
         self._dec_sess      = ort.InferenceSession(str(dec_path),      opts, providers=providers)
         self._dec_past_sess = ort.InferenceSession(str(dec_past_path), opts, providers=providers)
+        _disable_ort_fallback_if_cuda_requested(
+            providers,
+            [self._enc_sess, self._dec_sess, self._dec_past_sess],
+        )
 
         # Load tokenizer
         self._tok = _Tokenizer(str(tokenizer_path))
