@@ -628,9 +628,10 @@ def summarize(
     }
 
 
-def run_one(pdf_path: Path, output_dir: Path, device: str) -> int:
+def run_one(pdf_path: Path, output_dir: Path, device: str, ocr_backend: str) -> int:
     print(f"\n[smoke] {pdf_path}")
     print(f"[smoke] device={device}")
+    print(f"[smoke] OCR backend={ocr_backend}")
 
     pages: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
@@ -658,13 +659,16 @@ def run_one(pdf_path: Path, output_dir: Path, device: str) -> int:
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    output_json = output_dir / f"{pdf_path.stem}_{device}_smoke_output.json"
-    summary_json = output_dir / f"{pdf_path.stem}_{device}_smoke_summary.json"
+    # 2026-06-15: include OCR backend in smoke output names so ONNXTR and
+    # PP-OCRv6 benchmark runs can live side by side for comparison.
+    output_json = output_dir / f"{pdf_path.stem}_{device}_{ocr_backend}_smoke_output.json"
+    summary_json = output_dir / f"{pdf_path.stem}_{device}_{ocr_backend}_smoke_summary.json"
 
     output_payload = _json_safe(
         {
             "pdf": str(pdf_path),
             "device": device,
+            "ocr_backend": ocr_backend,
             "errors": errors,
             "pages": pages,
         }
@@ -674,6 +678,7 @@ def run_one(pdf_path: Path, output_dir: Path, device: str) -> int:
         {
             "pdf": str(pdf_path),
             "device": device,
+            "ocr_backend": ocr_backend,
             "summary": summary,
             "failures": failures,
         }
@@ -743,6 +748,12 @@ def main() -> int:
         default="cpu",
         help="device for layout/table ONNX inference. Default: cpu.",
     )
+    parser.add_argument(
+        "--ocr-backend",
+        choices=["onnxtr_fast_base", "ppocrv6_small"],
+        default="onnxtr_fast_base",
+        help="OCR backend for scanned pages. Default: onnxtr_fast_base.",
+    )
 
     args = parser.parse_args()
 
@@ -761,15 +772,18 @@ def main() -> int:
         return 1
 
     if not engine.is_warmed():
-        print(f"[smoke] warming Torvex engine on {args.device}...")
-        engine.warm(device=args.device)
+        print(
+            f"[smoke] warming Torvex engine on {args.device} "
+            f"with OCR backend {args.ocr_backend}..."
+        )
+        engine.warm(device=args.device, ocr_backend=args.ocr_backend)
 
     try:
         status = 0
         output_dir = Path(args.output_dir)
 
         for pdf_path in pdf_paths:
-            status |= run_one(pdf_path, output_dir, args.device)
+            status |= run_one(pdf_path, output_dir, args.device, args.ocr_backend)
 
         return status
 
