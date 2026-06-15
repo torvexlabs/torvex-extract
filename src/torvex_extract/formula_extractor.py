@@ -15,6 +15,8 @@ from typing import Any
 import numpy as np
 from PIL import Image, ImageOps
 
+from torvex_extract.onnx_runtime import select_onnx_providers
+
 logger = logging.getLogger(__name__)
 
 FormulaFallbackOcr = Callable[[np.ndarray], list[dict[str, Any]]]
@@ -905,11 +907,11 @@ class FormulaMfrExtractor:
                 str(model_root / "models" / "unimernet_tiny"),
             )
         )
-        providers = (
-            ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            if self.device in {"gpu", "cuda"}
-            else ["CPUExecutionProvider"]
-        )
+        # 2026-06-15: use the shared ONNX provider helper so UniMERNet gets
+        # the same Windows CUDA DLL preload path as layout/table/OCR sessions.
+        # Before this, formula-only GPU loading could miss cublas/cuDNN DLLs
+        # unless another engine happened to warm CUDA first.
+        providers = select_onnx_providers(self.device)
         use_iobinding = _env_bool(
             "TORVEX_UNIMERNET_IO_BINDING",
             self.device in {"gpu", "cuda"},
