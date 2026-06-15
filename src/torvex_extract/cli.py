@@ -111,7 +111,7 @@ def main() -> int:
         "--enable-formula",
         action="store_true",
         help=(
-            "enable optional Pix2Text-MFR ONNX formula LaTeX extraction "
+            "enable optional UniMERNet ONNX formula LaTeX extraction "
             "from detected formula boxes"
         ),
     )

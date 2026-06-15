@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-from torvex_extract.pure_onnx_mfr import PureOnnxMfr
-from torvex_extract.pure_onnx_unimernet import MAX_NEW_TOKENS as UNIMERNET_MAX_NEW_TOKENS
-from torvex_extract.pure_onnx_unimernet import OnnxUnimerNet
-
 import gc
+import importlib
 import logging
 import math
 import os
@@ -25,6 +22,7 @@ FormulaFallbackOcr = Callable[[np.ndarray], list[dict[str, Any]]]
 _FORMULA_NUMBER_TYPE = "formula_number"
 _DISPLAY_FORMULA_TYPE = "display_formula"
 _INLINE_FORMULA_TYPE = "inline_formula"
+UNIMERNET_MAX_NEW_TOKENS = 1534
 
 _LATEX_MARKERS = (
     "\\",
@@ -133,7 +131,7 @@ def _env_float(name: str, default: float, *, min_value: float, max_value: float)
 
 @dataclass(frozen=True)
 class FormulaExtractionConfig:
-    model_name: str = "breezedeus/pix2text-mfr-1.5"
+    model_name: str = "Sibitorvex/unimernet-tiny-onnx"
     enabled_formula_types: tuple[str, ...] = field(default_factory=_default_enabled_formula_types)
     accept_confidence: float = 0.75
     low_confidence: float = 0.55
@@ -146,11 +144,16 @@ class FormulaExtractionConfig:
     enable_self_consensus: bool = field(default_factory=lambda: _env_bool("TORVEX_FORMULA_SELF_CONSENSUS", False))
     consensus_padding_ratio: float = 0.08
     consensus_similarity_threshold: float = 0.92
-    # 2026-06-11: Pix2Text default stays 384 for latency, but the ceiling is
-    # high enough for UniMERNet ONNX's exported decoder limit. UniMERNet uses
-    # its full budget by default inside FormulaMfrExtractor unless this env is
-    # explicitly set.
-    max_new_tokens: int = field(default_factory=lambda: _env_int("TORVEX_FORMULA_MAX_NEW_TOKENS", 384, min_value=16, max_value=1534))
+    # UniMERNet's decoder can need a much larger budget than the old Pix2Text
+    # path. Treat early non-EOS stops as a quality signal, not a success.
+    max_new_tokens: int = field(
+        default_factory=lambda: _env_int(
+            "TORVEX_FORMULA_MAX_NEW_TOKENS",
+            UNIMERNET_MAX_NEW_TOKENS,
+            min_value=16,
+            max_value=UNIMERNET_MAX_NEW_TOKENS,
+        )
+    )
 
     # 2026-06-11 display-formula splitter:
     # PP-DocLayoutV3 frequently emits ONE display_formula box covering a
@@ -796,31 +799,6 @@ def _text_similarity(left: str, right: str) -> float:
     return SequenceMatcher(None, left_clean, right_clean).ratio()
 
 
-def _default_formula_model_dir() -> str:
-    env_value = os.getenv("TORVEX_FORMULA_MODEL_DIR")
-    if env_value:
-        return env_value
-
-    model_rel = Path("models") / "pix2text-mfr-1.5"
-
-    candidates: list[Path] = [
-        Path.cwd() / model_rel,
-    ]
-
-    # Important for editable installs:
-    # C:\torvex-extract\src\torvex_extract\formula_extractor.py
-    # -> C:\torvex-extract\models\pix2text-mfr-1.5
-    for parent in Path(__file__).resolve().parents:
-        candidates.append(parent / model_rel)
-
-    for candidate in candidates:
-        if candidate.exists():
-            return str(candidate)
-
-    # Final fallback keeps old behavior.
-    return str(model_rel)
-
-
 def _default_unimernet_onnx_root() -> Path:
     env_value = os.getenv("TORVEX_UNIMERNET_ONNX_MODEL_DIR")
     if env_value:
@@ -841,18 +819,47 @@ def _default_unimernet_onnx_root() -> Path:
     return model_rel
 
 
+def _load_unimernet_runtime() -> type[Any]:
+    try:
+        module = importlib.import_module("pure_onnx_unimernet")
+    except ImportError as exc:
+        raise RuntimeError(
+            "UniMERNet ONNX runtime is not installed. Install it into the "
+            "active Torvex environment with: uv pip install --no-deps "
+            "\"git+https://github.com/torvexlabs/unimernet-onnx.git\""
+        ) from exc
+
+    runtime = getattr(module, "OnnxUnimerNet", None)
+    if runtime is None:
+        raise RuntimeError(
+            "Installed pure_onnx_unimernet module does not expose OnnxUnimerNet."
+        )
+
+    return runtime
+
+
+def _unimernet_quality_confidence(result: dict[str, Any]) -> float:
+    latex = str(result.get("latex") or "").strip()
+    if not latex:
+        return 0.0
+
+    if bool(result.get("truncated")):
+        return 0.25
+
+    if result.get("eos_reached") is False:
+        return 0.50
+
+    return 0.90
+
+
 class FormulaMfrExtractor:
     """
-    Optional Pix2Text-MFR ONNX formula recognizer.
+    Optional UniMERNet ONNX formula recognizer.
 
     Important:
-    - PureOnnxMfr is loaded lazily only when a supported formula type is recognized.
+    - UniMERNet is loaded lazily only when a supported formula type is recognized.
     - This module does not mutate page final_text.
     - It only enriches existing formula bbox artifacts with LaTeX metadata.
-
-    This uses the local pure ONNXRuntime MFR model:
-    models/pix2text-mfr-1.5
-    No heavy framework wrapper package is required.
     """
 
     def __init__(
@@ -871,56 +878,60 @@ class FormulaMfrExtractor:
         if self._ocr is not None:
             return
 
-        engine_name = os.getenv("TORVEX_FORMULA_ENGINE", "pix2text").strip().lower()
-        if engine_name == "unimernet":
+        engine_name = (
+            os.getenv("TORVEX_FORMULA_ENGINE", "unimernet_onnx")
+            .strip()
+            .lower()
+        )
+        if engine_name and engine_name not in {"unimernet", "unimernet_onnx"}:
             logger.warning(
-                "TORVEX_FORMULA_ENGINE=unimernet is deprecated; using unimernet_onnx."
+                "TORVEX_FORMULA_ENGINE=%s is ignored; UniMERNet ONNX is the "
+                "only formula engine.",
+                engine_name,
             )
-            engine_name = "unimernet_onnx"
+        engine_name = "unimernet_onnx"
 
         self._recognize_max_new_tokens = self.config.max_new_tokens
-        if engine_name == "unimernet_onnx":
-            model_root = _default_unimernet_onnx_root()
-            artifacts_dir = Path(
-                os.getenv(
-                    "TORVEX_UNIMERNET_ONNX_ARTIFACTS_DIR",
-                    str(model_root / "artifacts"),
-                )
+        model_root = _default_unimernet_onnx_root()
+        artifacts_dir = Path(
+            os.getenv(
+                "TORVEX_UNIMERNET_ONNX_ARTIFACTS_DIR",
+                str(model_root / "artifacts"),
             )
-            tokenizer_path = Path(
-                os.getenv(
-                    "TORVEX_UNIMERNET_TOKENIZER_DIR",
-                    str(model_root / "models" / "unimernet_tiny"),
-                )
+        )
+        tokenizer_path = Path(
+            os.getenv(
+                "TORVEX_UNIMERNET_TOKENIZER_DIR",
+                str(model_root / "models" / "unimernet_tiny"),
             )
-            providers = (
-                ["CUDAExecutionProvider", "CPUExecutionProvider"]
-                if self.device in {"gpu", "cuda"}
-                else ["CPUExecutionProvider"]
-            )
-            logger.info(
-                "Formula engine: unimernet_onnx artifacts=%s tokenizer=%s providers=%s",
-                artifacts_dir,
-                tokenizer_path,
-                providers,
-            )
-            self._recognize_max_new_tokens = (
-                self.config.max_new_tokens
-                if os.getenv("TORVEX_FORMULA_MAX_NEW_TOKENS") is not None
-                else UNIMERNET_MAX_NEW_TOKENS
-            )
-            self._ocr = OnnxUnimerNet(
-                artifacts_dir=artifacts_dir,
-                tokenizer_path=tokenizer_path,
-                providers=providers,
-                max_new_tokens=self._recognize_max_new_tokens,
-            )
-        else:
-            logger.info("Formula engine: pix2text (pure_onnx_mfr)")
-            self._ocr = PureOnnxMfr(
-                model_dir=_default_formula_model_dir(),
-                device=self.device,
-            )
+        )
+        providers = (
+            ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            if self.device in {"gpu", "cuda"}
+            else ["CPUExecutionProvider"]
+        )
+        use_iobinding = _env_bool(
+            "TORVEX_UNIMERNET_IO_BINDING",
+            self.device in {"gpu", "cuda"},
+        )
+        logger.info(
+            "Formula engine: unimernet_onnx artifacts=%s tokenizer=%s providers=%s "
+            "max_new_tokens=%s io_binding=%s",
+            artifacts_dir,
+            tokenizer_path,
+            providers,
+            self._recognize_max_new_tokens,
+            use_iobinding,
+        )
+
+        runtime = _load_unimernet_runtime()
+        self._ocr = runtime(
+            artifacts_dir=artifacts_dir,
+            tokenizer_path=tokenizer_path,
+            providers=providers,
+            max_new_tokens=self._recognize_max_new_tokens,
+            use_iobinding=use_iobinding,
+        )
 
         logger.info(
             "Loaded formula MFR model: engine=%s device=%s",
@@ -933,10 +944,10 @@ class FormulaMfrExtractor:
 
         assert self._ocr is not None
 
-        return self._ocr.recognize(
-            crop,
-            max_new_tokens=self._recognize_max_new_tokens,
-        )
+        result = dict(self._ocr.recognize(crop))
+        result["latex"] = str(result.get("latex") or "").strip()
+        result["confidence"] = _unimernet_quality_confidence(result)
+        return result
 
     def _maybe_run_self_consensus(
         self,
@@ -1031,6 +1042,14 @@ class FormulaMfrExtractor:
                 "consensus_latex": "",
                 "consensus_confidence": 0.0,
                 "consensus_similarity": 0.0,
+                "token_count": 0,
+                "last_token": None,
+                "eos_reached": False,
+                "truncated": False,
+                "mfr_elapsed_ms": 0.0,
+                "mfr_ms_per_token": 0.0,
+                "mfr_active_providers": {},
+                "mfr_io_binding": False,
                 "quality_flags": [],
             }
 
@@ -1109,6 +1128,24 @@ class FormulaMfrExtractor:
 
             artifact["latex"] = latex
             artifact["confidence"] = confidence
+            artifact["token_count"] = int(
+                _safe_float(recognized.get("token_count"), 0.0)
+            )
+            artifact["last_token"] = recognized.get("last_token")
+            artifact["eos_reached"] = bool(recognized.get("eos_reached"))
+            artifact["truncated"] = bool(recognized.get("truncated"))
+            artifact["mfr_elapsed_ms"] = _safe_float(recognized.get("elapsed_ms"), 0.0)
+            artifact["mfr_ms_per_token"] = _safe_float(
+                recognized.get("ms_per_token"),
+                0.0,
+            )
+            artifact["mfr_active_providers"] = recognized.get("active_providers") or {}
+            artifact["mfr_io_binding"] = bool(recognized.get("io_binding"))
+
+            if artifact["truncated"]:
+                artifact["quality_flags"].append("mfr_truncated")
+            elif not artifact["eos_reached"]:
+                artifact["quality_flags"].append("mfr_no_eos")
 
             is_valid, validation_error = validate_latex(latex, formula_type)
 
