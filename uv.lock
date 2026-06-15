@@ -1172,6 +1172,8 @@ dependencies = [
     { name = "pdfplumber" },
     { name = "pillow" },
     { name = "psutil" },
+    { name = "pyclipper" },
+    { name = "pyyaml" },
     { name = "pypdfium2" },
 ]
 
@@ -1196,7 +1198,9 @@ requires-dist = [
     { name = "pdfplumber", specifier = ">=0.10.0" },
     { name = "pillow", specifier = ">=10.0.0" },
     { name = "psutil", specifier = ">=7.2.2" },
+    { name = "pyclipper", specifier = ">=1.4.0" },
     { name = "pypdfium2", specifier = ">=4.0.0" },
+    { name = "pyyaml", specifier = ">=6.0.0" },
     { name = "tokenizers", marker = "extra == 'formula'", specifier = ">=0.15.0" },
 ]
 provides-extras = ["formula"]
