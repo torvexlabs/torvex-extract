@@ -8,46 +8,8 @@ from PIL import Image
 
 import numpy as np
 
-_CUDA_DLL_HANDLES = []
-
-
-def _prepare_onnx_cuda_dll_paths() -> None:
-    """
-    Make NVIDIA CUDA/cuDNN wheel DLLs visible on Windows.
-
-    Needed because cuDNN may dynamically load engine DLLs at runtime.
-    """
-    import os
-    import sysconfig
-    from pathlib import Path
-
-    site_packages = Path(sysconfig.get_paths()["purelib"])
-    nvidia_root = site_packages / "nvidia"
-
-    dll_dirs = [
-        nvidia_root / "cudnn" / "bin",
-        nvidia_root / "cublas" / "bin",
-        nvidia_root / "cuda_runtime" / "bin",
-        nvidia_root / "cufft" / "bin",
-        nvidia_root / "curand" / "bin",
-        nvidia_root / "cuda_nvrtc" / "bin",
-        nvidia_root / "nvjitlink" / "bin",
-    ]
-
-    existing_dirs = [path for path in dll_dirs if path.exists()]
-
-    for path in existing_dirs:
-        try:
-            handle = os.add_dll_directory(str(path))
-            _CUDA_DLL_HANDLES.append(handle)
-        except Exception:
-            pass
-
-    current_path = os.environ.get("PATH", "")
-    prepend = ";".join(str(path) for path in existing_dirs)
-
-    if prepend:
-        os.environ["PATH"] = prepend + ";" + current_path
+from torvex_extract.onnx_runtime import create_onnx_session, select_onnx_providers
+from torvex_extract.ppocrv6_ocr import PPOCRV6SmallOCR, PPOCRV6_SMALL_BACKEND
 
 logger = logging.getLogger(__name__)
 
@@ -1320,63 +1282,27 @@ class TorvexExtractEngine:
         self._providers = None
 
     def _select_onnx_providers(self, device: str) -> list[str]:
-        import onnxruntime as ort
+        # 2026-06-15: provider selection moved to a shared helper so
+        # PP-DocLayoutV3, TATR, PP-OCRv6, and UniMERNet all get the same
+        # Windows CUDA DLL preload and fail-fast CUDA verification behavior.
+        return select_onnx_providers(device)
 
-        requested = (device or "cpu").strip().lower()
-
-        if requested in {"gpu"}:
-            _prepare_onnx_cuda_dll_paths()
-
-            if hasattr(ort, "preload_dlls"):
-                ort.preload_dlls(directory="")
-
-        available = set(ort.get_available_providers())
-
-        if requested == "cpu":
-            return ["CPUExecutionProvider"]
-
-        if requested == "gpu":
-            if "CUDAExecutionProvider" not in available:
-                raise RuntimeError(
-                    "GPU requested, but CUDAExecutionProvider is not available. "
-                    "Install/configure onnxruntime-gpu + CUDA, or use --device cpu."
-                )
-
-            return ["CUDAExecutionProvider"]
-
-        raise ValueError(
-            f"Unsupported device={device!r}. Expected: cpu, gpu."
-        )
-
-    def warm(self, device: str = "cpu"):
+    def warm(self, device: str = "cpu", ocr_backend: str | None = None):
         import sys
-        import onnxruntime as ort
 
         self._providers = self._select_onnx_providers(device)
 
-        self._layout = ort.InferenceSession(
+        self._layout = create_onnx_session(
             DOCLAYOUT_MODEL_PATH,
             providers=self._providers,
+            model_name="PP-DocLayoutV3",
         )
 
-        self._tatr = ort.InferenceSession(
+        self._tatr = create_onnx_session(
             TATR_MODEL_PATH,
             providers=self._providers,
+            model_name="TATR",
         )
-
-        if "CUDAExecutionProvider" in self._providers:
-            layout_providers = set(self._layout.get_providers())
-            tatr_providers = set(self._tatr.get_providers())
-
-            if "CUDAExecutionProvider" not in layout_providers:
-                raise RuntimeError(
-                    f"CUDA requested but layout session providers are {self._layout.get_providers()}"
-                )
-
-            if "CUDAExecutionProvider" not in tatr_providers:
-                raise RuntimeError(
-                    f"CUDA requested but TATR session providers are {self._tatr.get_providers()}"
-                )
 
         # 2026-05-27:
         # OCR routing is page-level in pypdfium_extractor.py.
@@ -1384,11 +1310,15 @@ class TorvexExtractEngine:
         # Scanned pages use ONNXTR by default.
         #
         # RapidOCR backend was removed.
-        # ONNXTR fast_base is the only OCR backend.
-        self._ocr_backend = os.getenv(
-            "Torvex_OCR_BACKEND",
-            "onnxtr_fast_base",
-        ).strip().lower()  
+        # 2026-06-15: PP-OCRv6 small is available as an opt-in second backend
+        # for Chinese/OmniDocBench comparison without changing downstream
+        # scanned-page routing.
+        self._ocr_backend = (
+            ocr_backend
+            or os.getenv("TORVEX_OCR_BACKEND")
+            or os.getenv("Torvex_OCR_BACKEND")
+            or "onnxtr_fast_base"
+        ).strip().lower()
         
         if self._ocr_backend == "onnxtr_fast_base":
             from onnxtr.models import EngineConfig, ocr_predictor
@@ -1405,11 +1335,19 @@ class TorvexExtractEngine:
                 reco_engine_cfg=ocr_engine_cfg,
                 clf_engine_cfg=ocr_engine_cfg,
             )
+        elif self._ocr_backend == PPOCRV6_SMALL_BACKEND:
+            # 2026-06-15: PP-OCRv6 is wired as a second OCR backend only.
+            # The rest of Torvex still receives the same OCR segment contract
+            # so scanned SAFE-zone assignment and scanned-table mapping do not
+            # change while we benchmark Chinese accuracy and latency.
+            self._ocr = PPOCRV6SmallOCR(
+                providers=self._providers,
+            )
         else:
             raise ValueError(
                 "Unsupported Torvex_OCR_BACKEND="
                 f"{self._ocr_backend!r}. "
-                "Expected 'onnxtr_fast_base'."
+                "Expected 'onnxtr_fast_base' or 'ppocrv6_small'."
             )
 
         paddle_mods = [module for module in sys.modules if "paddle" in module.lower()]
@@ -1447,7 +1385,7 @@ class TorvexExtractEngine:
         2026-05-27:
         Added after ONNXTR backend experiment.
         Smoke reports must show the real OCR backend used by scanned tables:
-            tatr_global_onnxtr_fast_base
+            tatr_global_onnxtr_fast_base or tatr_global_ppocrv6_small
 
         Do not read _ocr_backend directly outside this class.
         """
@@ -1483,9 +1421,9 @@ class TorvexExtractEngine:
         Run OCR on an RGB image crop/page and return Torvex OCR segments.
 
         Backend:
-            Torvex_OCR_BACKEND=onnxtr_fast_base
+            TORVEX_OCR_BACKEND=onnxtr_fast_base|ppocrv6_small
 
-        Default and only OCR backend is ONNXTR fast_base.
+        Default OCR backend is ONNXTR fast_base.
 
             OCR routing is page-level:
             digital page -> no OCR
@@ -1539,6 +1477,9 @@ class TorvexExtractEngine:
                 image_width=image_w,
                 image_height=image_h,
             )
+
+        if self._ocr_backend == PPOCRV6_SMALL_BACKEND:
+            return self._ocr.ocr_image(image_np)
 
         raise RuntimeError(f"Unsupported OCR backend: {self._ocr_backend}")
 
