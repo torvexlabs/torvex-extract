@@ -108,6 +108,13 @@ def main() -> int:
     )
 
     parser.add_argument(
+        "--ocr-backend",
+        choices=["onnxtr_fast_base", "ppocrv6_small"],
+        default="onnxtr_fast_base",
+        help="OCR backend for scanned pages. Default: onnxtr_fast_base.",
+    )
+
+    parser.add_argument(
         "--enable-formula",
         action="store_true",
         help=(
@@ -140,6 +147,7 @@ def main() -> int:
     print(f"[torvex-extract] input:  {pdf_path}")
     print(f"[torvex-extract] output: {output_path}")
     print(f"[torvex-extract] device: {args.device}")
+    print(f"[torvex-extract] OCR backend: {args.ocr_backend}")
     print(
         f"[torvex-extract] formula: "
         f"{'enabled' if args.enable_formula else 'disabled'}"
@@ -148,7 +156,7 @@ def main() -> int:
     started = time.perf_counter()
 
     try:
-        engine.warm(device=args.device)
+        engine.warm(device=args.device, ocr_backend=args.ocr_backend)
 
         pages, errors = extract_with_pypdfium2(
             str(pdf_path),
@@ -161,6 +169,7 @@ def main() -> int:
         payload = {
             "pdf": str(pdf_path),
             "device": args.device,
+            "ocr_backend": args.ocr_backend,
             "formula_enabled": args.enable_formula,
             "engine": "torvex_extract",
             "summary": _summary(pages, errors, elapsed_ms),
