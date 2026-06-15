@@ -1,8 +1,8 @@
 from torvex_extract.pypdfium_extractor import extract_with_pypdfium2, engine
 
 
-def warm(device: str = "cpu") -> None:
-    engine.warm(device=device)
+def warm(device: str = "cpu", ocr_backend: str | None = None) -> None:
+    engine.warm(device=device, ocr_backend=ocr_backend)
 
 
 def shutdown() -> None:
