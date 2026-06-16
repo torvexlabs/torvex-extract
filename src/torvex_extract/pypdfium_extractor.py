@@ -53,7 +53,10 @@ from torvex_extract.table_structure import (
     extract_table_explicit_pdfplumber,
 )
 
-from torvex_extract.formula_extractor import extract_formulas_from_bboxes
+from torvex_extract.formula_extractor import (
+    ensure_formula_runtime_available,
+    extract_formulas_from_bboxes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2081,6 +2084,9 @@ def extract_with_pypdfium2(
                 ),
             }
         ]
+
+    if enable_formula:
+        ensure_formula_runtime_available(device=formula_device)
 
     try:
         pdf = pypdfium2.PdfDocument(filepath)

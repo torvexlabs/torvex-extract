@@ -156,6 +156,17 @@ class FormulaExtractionConfig:
             max_value=UNIMERNET_MAX_NEW_TOKENS,
         )
     )
+    max_batch_size: int = field(
+        default_factory=lambda: _env_int(
+            "TORVEX_FORMULA_MAX_BATCH_SIZE",
+            8,
+            min_value=1,
+            max_value=32,
+        )
+    )
+    sort_by_size: bool = field(
+        default_factory=lambda: _env_bool("TORVEX_FORMULA_SORT_BY_SIZE", True)
+    )
 
     # 2026-06-11 display-formula splitter:
     # PP-DocLayoutV3 frequently emits ONE display_formula box covering a
@@ -951,6 +962,158 @@ class FormulaMfrExtractor:
         result["confidence"] = _unimernet_quality_confidence(result)
         return result
 
+    def preflight(self) -> None:
+        self._ensure_loaded()
+
+    def recognize_crops(self, crops: list[Image.Image]) -> list[dict[str, Any]]:
+        self._ensure_loaded()
+
+        assert self._ocr is not None
+
+        if not crops:
+            return []
+
+        recognize_batch = getattr(self._ocr, "recognize_batch", None)
+        if callable(recognize_batch):
+            raw_results = list(
+                recognize_batch(
+                    crops,
+                    max_batch_size=self.config.max_batch_size,
+                    sort_by_size=self.config.sort_by_size,
+                )
+            )
+        else:
+            raw_results = [self._ocr.recognize(crop) for crop in crops]
+
+        if len(raw_results) != len(crops):
+            raise RuntimeError(
+                "UniMERNet batch result count mismatch: "
+                f"expected {len(crops)}, got {len(raw_results)}"
+            )
+
+        results: list[dict[str, Any]] = []
+        for raw_result in raw_results:
+            result = dict(raw_result)
+            result["latex"] = str(result.get("latex") or "").strip()
+            result["confidence"] = _unimernet_quality_confidence(result)
+            results.append(result)
+
+        return results
+
+    def _apply_recognition_result(
+        self,
+        *,
+        artifact: dict[str, Any],
+        crop: Image.Image,
+        bbox_px: list[float],
+        formula_type: str,
+        recognized: dict[str, Any],
+        page_image: Image.Image,
+        fallback_ocr: FormulaFallbackOcr | None,
+    ) -> None:
+        latex = str(recognized.get("latex") or "").strip()
+        confidence = _safe_float(recognized.get("confidence"), 0.0)
+
+        artifact["latex"] = latex
+        artifact["confidence"] = confidence
+        artifact["token_count"] = int(
+            _safe_float(recognized.get("token_count"), 0.0)
+        )
+        artifact["last_token"] = recognized.get("last_token")
+        artifact["eos_reached"] = bool(recognized.get("eos_reached"))
+        artifact["truncated"] = bool(recognized.get("truncated"))
+        artifact["mfr_elapsed_ms"] = _safe_float(recognized.get("elapsed_ms"), 0.0)
+        artifact["mfr_ms_per_token"] = _safe_float(
+            recognized.get("ms_per_token"),
+            0.0,
+        )
+        artifact["mfr_active_providers"] = recognized.get("active_providers") or {}
+        artifact["mfr_io_binding"] = bool(recognized.get("io_binding"))
+        artifact["mfr_batch_size"] = int(
+            _safe_float(recognized.get("batch_size"), 1.0)
+        )
+        artifact["mfr_batch_group_index"] = int(
+            _safe_float(recognized.get("batch_group_index"), 0.0)
+        )
+
+        if artifact["truncated"]:
+            artifact["quality_flags"].append("mfr_truncated")
+        elif not artifact["eos_reached"]:
+            artifact["quality_flags"].append("mfr_no_eos")
+
+        is_valid, validation_error = validate_latex(latex, formula_type)
+
+        if not is_valid:
+            salvaged = _salvage_latex(latex, formula_type)
+            if salvaged:
+                artifact["latex"] = salvaged
+                artifact["quality_flags"].append(
+                    f"salvaged:{validation_error}"
+                )
+                latex = salvaged
+                is_valid, validation_error = True, ""
+
+        if not is_valid:
+            artifact["status"] = "invalid_latex"
+            artifact["validation_error"] = validation_error
+        elif confidence < self.config.low_confidence:
+            artifact["status"] = "text_fallback"
+        elif confidence < self.config.accept_confidence:
+            artifact["status"] = "low_confidence"
+        else:
+            artifact["status"] = "accepted"
+
+        if artifact["status"] in {"low_confidence", "invalid_latex", "text_fallback"}:
+            consensus = self._maybe_run_self_consensus(
+                page_image=page_image,
+                bbox_px=bbox_px,
+                first_latex=latex,
+                first_confidence=confidence,
+            )
+
+            if consensus:
+                artifact.update(consensus)
+
+                consensus_latex = str(consensus.get("consensus_latex") or "")
+                consensus_confidence = _safe_float(
+                    consensus.get("consensus_confidence"), 0.0
+                )
+                consensus_similarity = _safe_float(
+                    consensus.get("consensus_similarity"), 0.0
+                )
+
+                consensus_valid, consensus_error = validate_latex(
+                    consensus_latex,
+                    formula_type,
+                )
+
+                if not consensus_valid:
+                    artifact["quality_flags"].append(
+                        f"consensus_invalid: {consensus_error}"
+                    )
+
+                if (
+                    consensus_valid
+                    and consensus_similarity >= self.config.consensus_similarity_threshold
+                    and consensus_confidence > confidence
+                ):
+                    artifact["latex"] = consensus_latex
+                    artifact["confidence"] = consensus_confidence
+
+                    if consensus_confidence >= self.config.accept_confidence:
+                        artifact["status"] = "accepted"
+                        artifact["validation_error"] = ""
+                    elif consensus_confidence >= self.config.low_confidence:
+                        artifact["status"] = "low_confidence"
+                        artifact["validation_error"] = ""
+
+        if artifact["status"] in {"invalid_latex", "text_fallback"} and fallback_ocr is not None:
+            try:
+                segments = fallback_ocr(_as_crop_np(crop))
+                artifact["fallback_text"] = _join_ocr_segments(segments)
+            except Exception as exc:
+                artifact["quality_flags"].append(f"fallback_ocr_failed: {exc}")
+
     def _maybe_run_self_consensus(
         self,
         *,
@@ -1009,6 +1172,7 @@ class FormulaMfrExtractor:
             return []
 
         artifacts: list[dict[str, Any]] = []
+        pending_mfr: list[tuple[dict[str, Any], Image.Image, str, list[float]]] = []
 
         # 2026-06-11 display-formula splitter: expand merged PP-DocLayoutV3
         # display boxes into one bbox per equation BEFORE cropping/MFR.
@@ -1055,10 +1219,11 @@ class FormulaMfrExtractor:
                 "quality_flags": [],
             }
 
+            artifacts.append(artifact)
+
             if bbox_px is None:
                 artifact["status"] = "crop_empty"
                 artifact["validation_error"] = "missing_or_invalid_bbox_px"
-                artifacts.append(artifact)
                 continue
 
             if formula_type not in self.config.enabled_formula_types:
@@ -1066,7 +1231,6 @@ class FormulaMfrExtractor:
                 artifact["quality_flags"].append(
                     f"mfr_disabled_for_type:{formula_type}"
                 )
-                artifacts.append(artifact)
                 continue
 
             crop, crop_bbox_px = _crop_formula_image(
@@ -1088,7 +1252,6 @@ class FormulaMfrExtractor:
                         )
 
                 artifact["status"] = "skipped_formula_number"
-                artifacts.append(artifact)
                 continue
 
             if formula_type not in {_DISPLAY_FORMULA_TYPE, _INLINE_FORMULA_TYPE}:
@@ -1096,7 +1259,6 @@ class FormulaMfrExtractor:
 
             if crop is None:
                 artifact["status"] = "crop_empty"
-                artifacts.append(artifact)
                 continue
 
             crop_debug_path = _debug_save_formula_crop(
@@ -1107,13 +1269,18 @@ class FormulaMfrExtractor:
             if crop_debug_path:
                 artifact["crop_debug_path"] = crop_debug_path
 
-            try:
-                recognized = self.recognize_crop(crop)
-            except Exception as exc:
-                artifact["status"] = "text_fallback"
-                artifact["validation_error"] = f"mfr_error: {exc}"
+            pending_mfr.append((artifact, crop, formula_type, bbox_px))
 
-                if fallback_ocr is not None:
+        if pending_mfr:
+            crops = [crop for _, crop, _, _ in pending_mfr]
+            try:
+                recognized_items = self.recognize_crops(crops)
+            except Exception as exc:
+                for artifact, crop, _, _ in pending_mfr:
+                    artifact["status"] = "text_fallback"
+                    artifact["validation_error"] = f"mfr_error: {exc}"
+                    if fallback_ocr is None:
+                        continue
                     try:
                         segments = fallback_ocr(_as_crop_np(crop))
                         artifact["fallback_text"] = _join_ocr_segments(segments)
@@ -1121,111 +1288,22 @@ class FormulaMfrExtractor:
                         artifact["quality_flags"].append(
                             f"fallback_ocr_failed: {ocr_exc}"
                         )
-
-                artifacts.append(artifact)
-                continue
-
-            latex = str(recognized.get("latex") or "").strip()
-            confidence = _safe_float(recognized.get("confidence"), 0.0)
-
-            artifact["latex"] = latex
-            artifact["confidence"] = confidence
-            artifact["token_count"] = int(
-                _safe_float(recognized.get("token_count"), 0.0)
-            )
-            artifact["last_token"] = recognized.get("last_token")
-            artifact["eos_reached"] = bool(recognized.get("eos_reached"))
-            artifact["truncated"] = bool(recognized.get("truncated"))
-            artifact["mfr_elapsed_ms"] = _safe_float(recognized.get("elapsed_ms"), 0.0)
-            artifact["mfr_ms_per_token"] = _safe_float(
-                recognized.get("ms_per_token"),
-                0.0,
-            )
-            artifact["mfr_active_providers"] = recognized.get("active_providers") or {}
-            artifact["mfr_io_binding"] = bool(recognized.get("io_binding"))
-
-            if artifact["truncated"]:
-                artifact["quality_flags"].append("mfr_truncated")
-            elif not artifact["eos_reached"]:
-                artifact["quality_flags"].append("mfr_no_eos")
-
-            is_valid, validation_error = validate_latex(latex, formula_type)
-
-            # 2026-06-11 formula salvage: repair instead of reject. A
-            # truncated/garbled output that trims to a valid prefix is worth
-            # far more than an empty prediction (see patch header).
-            if not is_valid:
-                salvaged = _salvage_latex(latex, formula_type)
-                if salvaged:
-                    artifact["latex"] = salvaged
-                    artifact["quality_flags"].append(
-                        f"salvaged:{validation_error}"
-                    )
-                    latex = salvaged
-                    is_valid, validation_error = True, ""
-
-            if not is_valid:
-                artifact["status"] = "invalid_latex"
-                artifact["validation_error"] = validation_error
-            elif confidence < self.config.low_confidence:
-                artifact["status"] = "text_fallback"
-            elif confidence < self.config.accept_confidence:
-                artifact["status"] = "low_confidence"
             else:
-                artifact["status"] = "accepted"
-
-            if artifact["status"] in {"low_confidence", "invalid_latex", "text_fallback"}:
-                consensus = self._maybe_run_self_consensus(
-                    page_image=page_image,
-                    bbox_px=bbox_px,
-                    first_latex=latex,
-                    first_confidence=confidence,
-                )
-
-                if consensus:
-                    artifact.update(consensus)
-
-                    consensus_latex = str(consensus.get("consensus_latex") or "")
-                    consensus_confidence = _safe_float(
-                        consensus.get("consensus_confidence"), 0.0
+                for (
+                    artifact,
+                    crop,
+                    formula_type,
+                    bbox_px,
+                ), recognized in zip(pending_mfr, recognized_items):
+                    self._apply_recognition_result(
+                        artifact=artifact,
+                        crop=crop,
+                        bbox_px=bbox_px,
+                        formula_type=formula_type,
+                        recognized=recognized,
+                        page_image=page_image,
+                        fallback_ocr=fallback_ocr,
                     )
-                    consensus_similarity = _safe_float(
-                        consensus.get("consensus_similarity"), 0.0
-                    )
-
-                    consensus_valid, consensus_error = validate_latex(
-                        consensus_latex,
-                        formula_type,
-                    )
-
-                    if not consensus_valid:
-                        artifact["quality_flags"].append(
-                            f"consensus_invalid: {consensus_error}"
-                        )
-
-                    if (
-                        consensus_valid
-                        and consensus_similarity >= self.config.consensus_similarity_threshold
-                        and consensus_confidence > confidence
-                    ):
-                        artifact["latex"] = consensus_latex
-                        artifact["confidence"] = consensus_confidence
-
-                        if consensus_confidence >= self.config.accept_confidence:
-                            artifact["status"] = "accepted"
-                            artifact["validation_error"] = ""
-                        elif consensus_confidence >= self.config.low_confidence:
-                            artifact["status"] = "low_confidence"
-                            artifact["validation_error"] = ""
-
-            if artifact["status"] in {"invalid_latex", "text_fallback"} and fallback_ocr is not None:
-                try:
-                    segments = fallback_ocr(_as_crop_np(crop))
-                    artifact["fallback_text"] = _join_ocr_segments(segments)
-                except Exception as exc:
-                    artifact["quality_flags"].append(f"fallback_ocr_failed: {exc}")
-
-            artifacts.append(artifact)
 
         return artifacts
 
@@ -1248,6 +1326,18 @@ def get_formula_extractor(
         )
 
     return _EXTRACTORS[key]
+
+
+def ensure_formula_runtime_available(
+    *,
+    device: str | None = None,
+    config: FormulaExtractionConfig | None = None,
+) -> None:
+    extractor = get_formula_extractor(
+        device=device,
+        config=config,
+    )
+    extractor.preflight()
 
 
 def extract_formulas_from_bboxes(
