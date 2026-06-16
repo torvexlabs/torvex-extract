@@ -178,6 +178,8 @@ class PPOCRV6SmallOCR:
         )
         self.rec_image_height = 48
         self.rec_max_width = int(os.getenv("TORVEX_PPOCRV6_REC_MAX_WIDTH_PX", "3200"))
+        self.rec_batch_size = int(os.getenv("TORVEX_PPOCRV6_REC_BATCH_SIZE", "8"))
+        self.rec_batch_size = max(1, min(32, self.rec_batch_size))
 
         logger.info(
             "Loaded PP-OCRv6 small OCR: model_dir=%s det_providers=%s rec_providers=%s",
@@ -427,7 +429,7 @@ class PPOCRV6SmallOCR:
 
         return crop
 
-    def _preprocess_rec(self, crop_np: np.ndarray) -> np.ndarray | None:
+    def _preprocess_rec_chw(self, crop_np: np.ndarray) -> np.ndarray | None:
         crop_h, crop_w = crop_np.shape[:2]
         if crop_h <= 0 or crop_w <= 0:
             return None
@@ -446,7 +448,13 @@ class PPOCRV6SmallOCR:
         bgr = resized[:, :, ::-1].astype(np.float32)
         chw = bgr.transpose(2, 0, 1) / 255.0
         chw = (chw - 0.5) / 0.5
-        return chw[np.newaxis, ...].astype(np.float32)
+        return chw.astype(np.float32)
+
+    def _preprocess_rec(self, crop_np: np.ndarray) -> np.ndarray | None:
+        chw = self._preprocess_rec_chw(crop_np)
+        if chw is None:
+            return None
+        return chw[np.newaxis, ...]
 
     def _decode_recognition(
         self,
@@ -494,12 +502,64 @@ class PPOCRV6SmallOCR:
         logits = self.rec_session.run(None, {self.rec_input_name: rec_input})[0][0]
         return self._decode_recognition(logits)
 
+    def _recognize_crops(
+        self,
+        crops: list[np.ndarray],
+    ) -> list[tuple[str, float]]:
+        if not crops:
+            return []
+
+        preprocessed: list[tuple[int, np.ndarray]] = []
+        results: list[tuple[str, float]] = [("", 0.0) for _ in crops]
+
+        for index, crop in enumerate(crops):
+            chw = self._preprocess_rec_chw(crop)
+            if chw is not None:
+                preprocessed.append((index, chw))
+
+        if not preprocessed:
+            return results
+
+        preprocessed.sort(key=lambda item: item[1].shape[2])
+        batch_count = 0
+
+        for start in range(0, len(preprocessed), self.rec_batch_size):
+            chunk = preprocessed[start:start + self.rec_batch_size]
+            max_width = max(chw.shape[2] for _, chw in chunk)
+            batch = np.zeros(
+                (len(chunk), 3, self.rec_image_height, max_width),
+                dtype=np.float32,
+            )
+
+            for batch_index, (_, chw) in enumerate(chunk):
+                width = chw.shape[2]
+                batch[batch_index, :, :, :width] = chw
+
+            logits_batch = self.rec_session.run(
+                None,
+                {self.rec_input_name: batch},
+            )[0]
+
+            for (original_index, _), logits in zip(chunk, logits_batch):
+                results[original_index] = self._decode_recognition(logits)
+
+            batch_count += 1
+
+        logger.debug(
+            "PP-OCRv6 recognized %d crops in %d batches batch_size=%d",
+            len(preprocessed),
+            batch_count,
+            self.rec_batch_size,
+        )
+        return results
+
     def ocr_image(self, image_np: np.ndarray) -> list[dict[str, Any]]:
         if image_np is None or image_np.size == 0:
             return []
 
         image_h, image_w = image_np.shape[:2]
         segments: list[dict[str, Any]] = []
+        text_items: list[tuple[dict[str, Any], np.ndarray]] = []
 
         for box in self._detect_text_boxes(image_np):
             bbox_xyxy = box["bbox_xyxy"]
@@ -514,10 +574,19 @@ class PPOCRV6SmallOCR:
                     continue
                 crop = image_np[y0:y1, x0:x1]
 
-            text, rec_score = self._recognize_crop(crop)
+            text_items.append((box, crop))
+
+        logger.debug("PP-OCRv6 detected %d text crops", len(text_items))
+
+        recognized_items = self._recognize_crops(
+            [crop for _, crop in text_items]
+        )
+
+        for (box, _), (text, rec_score) in zip(text_items, recognized_items):
             if not text:
                 continue
 
+            bbox_xyxy = box["bbox_xyxy"]
             score = (
                 (float(box["score"]) + rec_score) / 2.0
                 if rec_score
