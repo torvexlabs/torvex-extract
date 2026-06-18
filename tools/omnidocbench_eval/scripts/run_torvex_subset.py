@@ -9,7 +9,6 @@ import subprocess
 import sys
 import threading
 import time
-import zlib
 from pathlib import Path
 from typing import Any
 
@@ -49,76 +48,6 @@ from omnidocbench_markdown import export_markdown_prediction
 from torvex_extract.formula_extractor import shutdown_formula_extractor
 from torvex_extract.pypdfium_extractor import extract_with_pypdfium2
 from torvex_extract.visual_zoning import engine
-
-
-def _pdf_number(value: float) -> str:
-    return f"{value:.6f}".rstrip("0").rstrip(".")
-
-
-def _write_lossless_image_pdf(img: Image.Image, pdf_path: Path, *, dpi: float) -> None:
-    """
-    Write a single-page image PDF without JPEG/DCT recompression.
-
-    Pillow's RGB PDF writer can introduce enough JPEG ringing to perturb
-    UniMERNet formula recognition. OmniDocBench page images are already raster
-    inputs, so the benchmark runner should preserve those pixels through the
-    temporary PDF stage.
-    """
-    img = img.convert("RGB")
-    width_px, height_px = img.size
-    width_pt = width_px * 72.0 / dpi
-    height_pt = height_px * 72.0 / dpi
-
-    image_stream = zlib.compress(img.tobytes())
-    content = (
-        f"q\n{_pdf_number(width_pt)} 0 0 {_pdf_number(height_pt)} 0 0 cm\n"
-        "/Im0 Do\nQ\n"
-    ).encode("ascii")
-
-    objects = [
-        b"<< /Type /Catalog /Pages 2 0 R >>",
-        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-        (
-            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 "
-            f"{_pdf_number(width_pt)} {_pdf_number(height_pt)}] "
-            "/Resources << /XObject << /Im0 4 0 R >> >> "
-            "/Contents 5 0 R >>"
-        ).encode("ascii"),
-        (
-            f"<< /Type /XObject /Subtype /Image /Width {width_px} "
-            f"/Height {height_px} /ColorSpace /DeviceRGB "
-            f"/BitsPerComponent 8 /Filter /FlateDecode "
-            f"/Length {len(image_stream)} >>\nstream\n"
-        ).encode("ascii")
-        + image_stream
-        + b"\nendstream",
-        (
-            f"<< /Length {len(content)} >>\nstream\n"
-        ).encode("ascii")
-        + content
-        + b"endstream",
-    ]
-
-    with pdf_path.open("wb") as handle:
-        handle.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
-        offsets = [0]
-        for obj_num, obj in enumerate(objects, start=1):
-            offsets.append(handle.tell())
-            handle.write(f"{obj_num} 0 obj\n".encode("ascii"))
-            handle.write(obj)
-            handle.write(b"\nendobj\n")
-
-        xref_offset = handle.tell()
-        handle.write(f"xref\n0 {len(objects) + 1}\n".encode("ascii"))
-        handle.write(b"0000000000 65535 f \n")
-        for offset in offsets[1:]:
-            handle.write(f"{offset:010d} 00000 n \n".encode("ascii"))
-        handle.write(
-            (
-                f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
-                f"startxref\n{xref_offset}\n%%EOF\n"
-            ).encode("ascii")
-        )
 
 
 def json_safe(value: Any) -> Any:
@@ -169,7 +98,7 @@ def image_to_single_page_pdf(image_path: Path, pdf_path: Path) -> None:
         else:
             img = img.convert("RGB")
 
-        _write_lossless_image_pdf(img, pdf_path, dpi=200.0)
+        img.save(pdf_path, "PDF", resolution=200.0)
 
 
 def find_image(raw_images_dir: Path, gt_image_path: str) -> Path:
@@ -440,15 +369,24 @@ def main() -> int:
     parser.add_argument(
         "--ocr-backend",
         choices=["onnxtr_fast_base", "ppocrv6_small"],
-        default="onnxtr_fast_base",
+        default="ppocrv6_small",
     )
     parser.add_argument("--enable-formula", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--keep-pdfs", action="store_true")
     parser.add_argument("--clean", action="store_true")
+    parser.add_argument(
+        "--trust-model",
+        action="store_true",
+        help="Bypass all formula validation/splitting/salvage. Raw bbox -> UniMERNet -> raw LaTeX.",
+    )
 
     args = parser.parse_args()
     formula_device = args.formula_device or args.device
+
+    if args.trust_model:
+        import os as _os
+        _os.environ["TORVEX_FORMULA_TRUST_MODEL"] = "true"
 
     subset_json = args.subset_json
     samples = json.loads(subset_json.read_text(encoding="utf-8-sig"))
@@ -487,6 +425,7 @@ def main() -> int:
     print(f"[torvex-odb] formula_device: {formula_device}")
     print(f"[torvex-odb] ocr_backend: {args.ocr_backend}")
     print(f"[torvex-odb] formula: {args.enable_formula}")
+    print(f"[torvex-odb] trust_model: {args.trust_model}")
 
     sampler.start()
 

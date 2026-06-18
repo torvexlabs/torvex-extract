@@ -124,6 +124,13 @@ def main() -> int:
     )
 
     parser.add_argument(
+        "--formula-device",
+        choices=["cpu", "gpu"],
+        default=None,
+        help="ONNX inference device for formula extraction. Defaults to --device.",
+    )
+
+    parser.add_argument(
         "--pretty",
         action="store_true",
         help="write pretty indented JSON",
@@ -143,10 +150,12 @@ def main() -> int:
 
     output_path = Path(args.out) if args.out else pdf_path.with_suffix(".torvex.json")
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    formula_device = args.formula_device or args.device
 
     print(f"[torvex-extract] input:  {pdf_path}")
     print(f"[torvex-extract] output: {output_path}")
     print(f"[torvex-extract] device: {args.device}")
+    print(f"[torvex-extract] formula device: {formula_device}")
     print(f"[torvex-extract] OCR backend: {args.ocr_backend}")
     print(
         f"[torvex-extract] formula: "
@@ -161,7 +170,7 @@ def main() -> int:
         pages, errors = extract_with_pypdfium2(
             str(pdf_path),
             enable_formula=args.enable_formula,
-            formula_device=args.device,
+            formula_device=formula_device,
         )
 
         elapsed_ms = (time.perf_counter() - started) * 1000.0
@@ -169,6 +178,7 @@ def main() -> int:
         payload = {
             "pdf": str(pdf_path),
             "device": args.device,
+            "formula_device": formula_device,
             "ocr_backend": args.ocr_backend,
             "formula_enabled": args.enable_formula,
             "engine": "torvex_extract",
