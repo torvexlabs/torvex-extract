@@ -9,7 +9,6 @@ from pathlib import Path
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from difflib import SequenceMatcher
 from typing import Any
 
 import numpy as np
@@ -25,41 +24,6 @@ _FORMULA_NUMBER_TYPE = "formula_number"
 _DISPLAY_FORMULA_TYPE = "display_formula"
 _INLINE_FORMULA_TYPE = "inline_formula"
 UNIMERNET_MAX_NEW_TOKENS = 1534
-
-_LATEX_MARKERS = (
-    "\\",
-    "^",
-    "_",
-    "{",
-    "}",
-    "=",
-    "+",
-    "-",
-    "*",
-    "/",
-    r"\frac",
-    r"\sqrt",
-    r"\sum",
-    r"\int",
-    r"\lim",
-    r"\log",
-    r"\sin",
-    r"\cos",
-    r"\tan",
-    r"\alpha",
-    r"\beta",
-    r"\gamma",
-    r"\delta",
-    r"\lambda",
-    r"\mu",
-    r"\sigma",
-    r"\theta",
-)
-
-_WORD_RE = re.compile(r"[A-Za-z]{4,}")
-_BROKEN_COMMAND_RE = re.compile(r"\\[^A-Za-z{}\s]")
-_REPEATED_GARBAGE_RE = re.compile(r"(.{1,8})\1{5,}")
-
 
 _ALLOWED_FORMULA_TYPES = frozenset(
     {
@@ -135,17 +99,13 @@ def _env_float(name: str, default: float, *, min_value: float, max_value: float)
 class FormulaExtractionConfig:
     model_name: str = "Sibitorvex/unimernet-tiny-onnx"
     enabled_formula_types: tuple[str, ...] = field(default_factory=_default_enabled_formula_types)
-    accept_confidence: float = 0.75
-    low_confidence: float = 0.55
     padding_ratio: float = field(default_factory=lambda: _env_float("TORVEX_FORMULA_PADDING_RATIO", 0.01, min_value=0.0, max_value=0.20))
     min_padding_px: int = field(default_factory=lambda: _env_int("TORVEX_FORMULA_MIN_PADDING_PX", 2, min_value=0, max_value=64))
     white_border_px: int = field(default_factory=lambda: _env_int("TORVEX_FORMULA_WHITE_BORDER_PX", 8, min_value=0, max_value=64))
     min_crop_width_px: int = 8
     min_crop_height_px: int = 8
     blank_dark_ratio_threshold: float = 0.0005
-    enable_self_consensus: bool = field(default_factory=lambda: _env_bool("TORVEX_FORMULA_SELF_CONSENSUS", False))
-    consensus_padding_ratio: float = 0.08
-    consensus_similarity_threshold: float = 0.92
+    enable_fallback_ocr: bool = field(default_factory=lambda: _env_bool("TORVEX_FORMULA_FALLBACK_OCR", False))
     # UniMERNet's decoder can need a much larger budget than the old Pix2Text
     # path. Treat early non-EOS stops as a quality signal, not a success.
     max_new_tokens: int = field(
@@ -181,9 +141,18 @@ class FormulaExtractionConfig:
     # (~one text line). Matrices self-protect: bracket verticals ink every
     # row, so they produce no blank runs at all (verified on debug crops).
     enable_display_split: bool = field(default_factory=lambda: _env_bool("TORVEX_FORMULA_SPLIT", True))
-    split_min_gap_px: int = field(default_factory=lambda: _env_int("TORVEX_FORMULA_SPLIT_MIN_GAP_PX", 12, min_value=4, max_value=200))
-    split_gap_ratio: float = field(default_factory=lambda: _env_float("TORVEX_FORMULA_SPLIT_GAP_RATIO", 0.35, min_value=0.05, max_value=2.0))
+    split_min_gap_px: int = field(default_factory=lambda: _env_int("TORVEX_FORMULA_SPLIT_MIN_GAP_PX", 5, min_value=2, max_value=200))
+    split_gap_ratio: float = field(default_factory=lambda: _env_float("TORVEX_FORMULA_SPLIT_GAP_RATIO", 0.25, min_value=0.05, max_value=2.0))
+    split_min_content_height_px: int = field(default_factory=lambda: _env_int("TORVEX_FORMULA_SPLIT_MIN_CONTENT_PX", 20, min_value=8, max_value=200))
     split_max_segments: int = field(default_factory=lambda: _env_int("TORVEX_FORMULA_SPLIT_MAX_SEGMENTS", 12, min_value=2, max_value=64))
+    # Force-bisect fallback: for bboxes taller than this threshold where the
+    # main pass finds no qualifying gap (>= split_min_gap_px), retry with any
+    # blank run (even 1px) that has split_min_content_height_px on both sides.
+    # Catches equations that are nearly touching (1-4px gap) inside a merged bbox.
+    # Set 0 to disable.
+    split_force_bisect_height_px: int = field(default_factory=lambda: _env_int("TORVEX_FORMULA_SPLIT_FORCE_BISECT_PX", 150, min_value=0, max_value=1000))
+
+    trust_model_output: bool = field(default_factory=lambda: _env_bool("TORVEX_FORMULA_TRUST_MODEL", True))
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -379,9 +348,10 @@ def _horizontal_white_gap_segments(
     height, width = gray.shape
     dark_per_row = (gray < 245).sum(axis=1)
 
-    # A "blank" row tolerates a few dark pixels (scan noise, bleed-through)
-    # but NOT a \vdots / \ddots row, which carries visibly more ink.
-    blank_row_max_dark = max(1, int(width * 0.004))
+    # Tolerate up to 0.8% of row width as dark pixels (scan noise,
+    # bleed-through, light ruling lines). The old 0.4% was too strict and
+    # missed real gaps that had a few stray dark pixels.
+    blank_row_max_dark = max(2, int(width * 0.008))
     is_blank = dark_per_row <= blank_row_max_dark
 
     # Run-length encode rows into alternating blank/content runs.
@@ -396,31 +366,72 @@ def _horizontal_white_gap_segments(
     if len(content_runs) <= 1:
         return whole
 
-    # 2026-06-11 threshold calibration (measured on run_042 debug crops):
-    # equation boundaries are 16-18px blank runs, scan noise is 1-5px, and
-    # matrices produce ZERO blank runs (bracket verticals ink every row, so
-    # they self-protect). Ratio is anchored to the SMALLEST substantial
-    # content run (~one text line height), NOT the median: fraction-heavy
-    # equations produce 120px+ content runs that inflate the median and
-    # push the threshold past real boundaries.
     substantial = [e - s for s, e in content_runs if (e - s) >= 8]
     line_h = min(substantial) if substantial else min(e - s for s, e in content_runs)
     min_gap = max(float(config.split_min_gap_px), line_h * config.split_gap_ratio)
 
-    # Interior blank runs tall enough to be equation boundaries.
+    # Build candidate cuts: interior blank runs tall enough to be equation
+    # boundaries AND where both adjacent content runs look like real
+    # equations (not internal whitespace within a tall fraction/matrix).
+    min_content_h = float(config.split_min_content_height_px)
     cut_rows: list[int] = []
-    for s, e, blank in runs:
+    for run_idx, (s, e, blank) in enumerate(runs):
         if not blank or s == 0 or e == height:
             continue
-        if (e - s) >= min_gap:
+        if (e - s) < min_gap:
+            continue
+
+        # Find the content run heights on each side of this gap.
+        above_h = 0.0
+        for prev_idx in range(run_idx - 1, -1, -1):
+            ps, pe, pb = runs[prev_idx]
+            if not pb:
+                above_h += pe - ps
+            else:
+                break
+
+        below_h = 0.0
+        for next_idx in range(run_idx + 1, len(runs)):
+            ns, ne, nb = runs[next_idx]
+            if not nb:
+                below_h += ne - ns
+            else:
+                break
+
+        if above_h >= min_content_h and below_h >= min_content_h:
             cut_rows.append((s + e) // 2)
 
     if not cut_rows:
-        return whole
+        # Force-bisect fallback: for tall bboxes where the main pass found no
+        # qualifying gap, retry with no minimum gap size. Any blank run (even
+        # 1px) that has split_min_content_height_px of content on both sides
+        # is accepted as a cut. This catches equations that are nearly touching
+        # (1-4px gap) inside a merged detection bbox.
+        force_h = config.split_force_bisect_height_px
+        if force_h > 0 and height >= force_h:
+            for run_idx, (s, e, blank) in enumerate(runs):
+                if not blank or s == 0 or e == height:
+                    continue
+                above_h = 0.0
+                for prev_idx in range(run_idx - 1, -1, -1):
+                    ps, pe, pb = runs[prev_idx]
+                    if not pb:
+                        above_h += pe - ps
+                    else:
+                        break
+                below_h = 0.0
+                for next_idx in range(run_idx + 1, len(runs)):
+                    ns, ne, nb = runs[next_idx]
+                    if not nb:
+                        below_h += ne - ns
+                    else:
+                        break
+                if above_h >= min_content_h and below_h >= min_content_h:
+                    cut_rows.append((s + e) // 2)
+        if not cut_rows:
+            return whole
 
     if len(cut_rows) + 1 > config.split_max_segments:
-        # Too many cuts is a red flag (dense dotted/matrix structure).
-        # Refuse to split rather than shred a single tall equation.
         return whole
 
     # Build segments between cuts, then tighten each to its own content
@@ -452,16 +463,16 @@ def _split_display_formula_bboxes(
     page_image: Image.Image,
     formula_bboxes: list[dict[str, Any]],
     config: FormulaExtractionConfig,
+    *,
+    _depth: int = 0,
 ) -> list[dict[str, Any]]:
     """
-    2026-06-11 display-formula splitter entry point.
-
     Expands merged display_formula bboxes into one bbox per equation.
-    Non-display formulas and unsplittable boxes pass through unchanged.
-    Children inherit the parent dict (type, score, ...) but get their own
-    bbox_px, a derived formula_id "<parent>_s<i>", a "split_from" tag for
-    traceability, and None pdfium/plumber boxes (only the parent zone had
-    coordinates in those spaces; the exporter keys off bbox_px).
+
+    Runs two passes: the main pixel-gap pass plus the force-bisect fallback
+    (for tall bboxes with tiny gaps). After the first split, applies one
+    recursive pass to child segments so that e.g. a 380px bbox split into two
+    170px children can each be split again if they still contain 2 equations.
     """
     if not config.enable_display_split:
         return list(formula_bboxes or [])
@@ -470,6 +481,10 @@ def _split_display_formula_bboxes(
 
     for formula in formula_bboxes or []:
         if str(formula.get("type") or "") != _DISPLAY_FORMULA_TYPE:
+            expanded.append(formula)
+            continue
+
+        if bool(formula.get("preserve_display_group")):
             expanded.append(formula)
             continue
 
@@ -484,6 +499,7 @@ def _split_display_formula_bboxes(
             continue
 
         parent_id = str(formula.get("formula_id") or "formula")
+        children: list[dict[str, Any]] = []
         for seg_index, (seg_y0, seg_y1) in enumerate(segments):
             child = dict(formula)
             child["bbox_px"] = [bbox_px[0], seg_y0, bbox_px[2], seg_y1]
@@ -491,40 +507,259 @@ def _split_display_formula_bboxes(
             child["bbox_pdfium"] = None
             child["bbox_plumber"] = None
             child["split_from"] = parent_id
-            expanded.append(child)
+            children.append(child)
 
+        # One recursive pass: children that are still tall enough to contain
+        # multiple equations get split again (catches cases like a 380px bbox
+        # initially split into two 170px halves, each still holding 2 GTs).
+        if _depth == 0:
+            children = _split_display_formula_bboxes(
+                page_image, children, config, _depth=1
+            )
+
+        expanded.extend(children)
         logger.debug(
-            "display-formula split: %s -> %d segments", parent_id, len(segments)
+            "display-formula split: %s -> %d segments (depth=%d)",
+            parent_id, len(children), _depth,
         )
 
     return expanded
 
 
+def _bbox_area(bbox_px: list[float] | None) -> float:
+    if bbox_px is None:
+        return 0.0
+
+    x0, y0, x1, y1 = bbox_px
+    return max(0.0, x1 - x0) * max(0.0, y1 - y0)
+
+
+def _bbox_intersection_area(
+    left: list[float] | None,
+    right: list[float] | None,
+) -> float:
+    if left is None or right is None:
+        return 0.0
+
+    lx0, ly0, lx1, ly1 = left
+    rx0, ry0, rx1, ry1 = right
+
+    ix0 = max(lx0, rx0)
+    iy0 = max(ly0, ry0)
+    ix1 = min(lx1, rx1)
+    iy1 = min(ly1, ry1)
+
+    return max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+
+
+def _bbox_iou(left: list[float] | None, right: list[float] | None) -> float:
+    left_area = _bbox_area(left)
+    right_area = _bbox_area(right)
+    if left_area <= 0.0 or right_area <= 0.0:
+        return 0.0
+
+    intersection = _bbox_intersection_area(left, right)
+    union = left_area + right_area - intersection
+    if union <= 0.0:
+        return 0.0
+
+    return intersection / union
+
+
+def _bbox_ioa(inner: list[float] | None, outer: list[float] | None) -> float:
+    inner_area = _bbox_area(inner)
+    if inner_area <= 0.0:
+        return 0.0
+
+    return _bbox_intersection_area(inner, outer) / inner_area
+
+
+def _is_split_formula(formula: dict[str, Any]) -> bool:
+    if formula.get("split_from"):
+        return True
+
+    formula_id = str(formula.get("formula_id") or "")
+    return bool(re.search(r"_s\d+$", formula_id))
+
+
+def _prefer_formula_candidate(
+    left: dict[str, Any],
+    right: dict[str, Any],
+) -> dict[str, Any]:
+    left_split = _is_split_formula(left)
+    right_split = _is_split_formula(right)
+
+    if left_split != right_split:
+        return right if left_split else left
+
+    left_score = _safe_float(left.get("score"), 0.0)
+    right_score = _safe_float(right.get("score"), 0.0)
+    if abs(left_score - right_score) > 0.05:
+        return left if left_score > right_score else right
+
+    left_area = _bbox_area(_extract_bbox_px(left))
+    right_area = _bbox_area(_extract_bbox_px(right))
+    return left if left_area <= right_area else right
+
+
+def _contained_display_children(
+    formula_bboxes: list[dict[str, Any]],
+    parent_index: int,
+    display_indexes: list[int],
+    parent_bbox: list[float],
+    parent_area: float,
+) -> list[int]:
+    children: list[int] = []
+
+    for child_index in display_indexes:
+        if child_index == parent_index:
+            continue
+
+        child_bbox = _extract_bbox_px(formula_bboxes[child_index])
+        child_area = _bbox_area(child_bbox)
+        if child_area <= 0.0 or child_area > parent_area * 0.75:
+            continue
+
+        if _bbox_ioa(child_bbox, parent_bbox) >= 0.85:
+            children.append(child_index)
+
+    return children
+
+
+def _should_preserve_display_parent(
+    formula_bboxes: list[dict[str, Any]],
+    parent_index: int,
+    child_indexes: list[int],
+) -> bool:
+    if len(child_indexes) < 2:
+        return False
+
+    parent_score = _safe_float(formula_bboxes[parent_index].get("score"), 0.0)
+    child_scores = [
+        _safe_float(formula_bboxes[child_index].get("score"), 0.0)
+        for child_index in child_indexes
+    ]
+    best_child_score = max(child_scores, default=0.0)
+
+    return parent_score >= 0.65 and (parent_score - best_child_score) >= 0.15
+
+
+def _suppress_duplicate_display_formula_bboxes(
+    formula_bboxes: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Remove display-formula parent/child duplicates before MFR.
+
+    PP-DocLayout can emit a large display_formula group and separate child
+    display_formula boxes for the same visual region. The splitter can also
+    create children that overlap original child detections. IoU misses these
+    cases because child boxes are intentionally much smaller than parents, so
+    this uses directional containment (IoA) for parent-child suppression and
+    IoU for near-identical duplicates.
+    """
+    if len(formula_bboxes) <= 1:
+        return list(formula_bboxes or [])
+
+    formula_bboxes = [dict(formula) for formula in formula_bboxes or []]
+
+    display_indexes = [
+        index
+        for index, formula in enumerate(formula_bboxes)
+        if str(formula.get("type") or "") == _DISPLAY_FORMULA_TYPE
+        and _extract_bbox_px(formula) is not None
+    ]
+    suppressed: set[int] = set()
+
+    # Drop parent/group display boxes when they contain multiple smaller
+    # display formulas unless the parent is clearly the stronger detection.
+    # Some DocLayout outputs include a high-confidence full multi-line formula
+    # plus low-confidence row fragments; OmniDocBench often scores the full
+    # parent as one isolated equation, so preserving that parent avoids
+    # shredding the crop before UniMERNet sees it.
+    for parent_index in display_indexes:
+        parent_bbox = _extract_bbox_px(formula_bboxes[parent_index])
+        parent_area = _bbox_area(parent_bbox)
+        if parent_area <= 0.0:
+            continue
+
+        contained_children = _contained_display_children(
+            formula_bboxes,
+            parent_index,
+            display_indexes,
+            parent_bbox,
+            parent_area,
+        )
+
+        if _should_preserve_display_parent(
+            formula_bboxes,
+            parent_index,
+            contained_children,
+        ):
+            formula_bboxes[parent_index]["preserve_display_group"] = True
+        elif len(contained_children) >= 2:
+            suppressed.add(parent_index)
+
+    # Resolve near-identical or split-vs-original duplicates among survivors.
+    for left_pos, left_index in enumerate(display_indexes):
+        if left_index in suppressed:
+            continue
+
+        left_bbox = _extract_bbox_px(formula_bboxes[left_index])
+        left_area = _bbox_area(left_bbox)
+        if left_area <= 0.0:
+            continue
+
+        for right_index in display_indexes[left_pos + 1 :]:
+            if right_index in suppressed:
+                continue
+
+            right_bbox = _extract_bbox_px(formula_bboxes[right_index])
+            right_area = _bbox_area(right_bbox)
+            if right_area <= 0.0:
+                continue
+
+            smaller_area = min(left_area, right_area)
+            larger_area = max(left_area, right_area)
+            area_ratio = smaller_area / larger_area if larger_area > 0.0 else 0.0
+            smaller_inside_larger = max(
+                _bbox_ioa(left_bbox, right_bbox),
+                _bbox_ioa(right_bbox, left_bbox),
+            )
+            is_duplicate = (
+                _bbox_iou(left_bbox, right_bbox) >= 0.75
+                or (smaller_inside_larger >= 0.85 and area_ratio >= 0.40)
+            )
+            if not is_duplicate:
+                continue
+
+            preferred = _prefer_formula_candidate(
+                formula_bboxes[left_index],
+                formula_bboxes[right_index],
+            )
+            if preferred is formula_bboxes[left_index]:
+                suppressed.add(right_index)
+            else:
+                suppressed.add(left_index)
+                break
+
+    if not suppressed:
+        return list(formula_bboxes)
+
+    for index in sorted(suppressed):
+        formula = formula_bboxes[index]
+        logger.debug(
+            "suppressed duplicate display formula candidate: %s",
+            formula.get("formula_id", index),
+        )
+
+    return [
+        formula
+        for index, formula in enumerate(formula_bboxes)
+        if index not in suppressed
+    ]
+
+
 # --- end 2026-06-11 display-formula splitter --------------------------------
-
-
-def _balanced(text: str, left: str, right: str) -> bool:
-    depth = 0
-    escaped = False
-
-    for char in text:
-        if escaped:
-            escaped = False
-            continue
-
-        if char == "\\":
-            escaped = True
-            continue
-
-        if char == left:
-            depth += 1
-        elif char == right:
-            depth -= 1
-
-        if depth < 0:
-            return False
-
-    return depth == 0
 
 
 def _debug_save_formula_crop(
@@ -557,210 +792,20 @@ def _debug_save_formula_crop(
         return f"crop_debug_save_failed:{exc}"
 
 
-_ALLOWED_SINGLE_CHAR_LATEX_COMMANDS = frozenset(
-    {
-        "\\",  # row break: \\
-        ",",  # thin space: \,
-        ";",
-        ":",
-        "!",
-        "_",
-        "#",
-        "%",
-        "&",
-        "$",
-        "{",
-        "}",
-        "[",
-        "]",
-        "(",
-        ")",
-        "|",
-        "~",
-    }
-)
-
-
-def _has_broken_latex_command(text: str) -> bool:
-    index = 0
-    length = len(text)
-
-    while index < length:
-        if text[index] != "\\":
-            index += 1
-            continue
-
-        if index + 1 >= length:
-            return True
-
-        next_char = text[index + 1]
-
-        # Standard LaTeX command: \frac, \left, \right, \begin, etc.
-        if next_char.isalpha():
-            cursor = index + 2
-            while cursor < length and text[cursor].isalpha():
-                cursor += 1
-            index = cursor
-            continue
-
-        # Common valid one-character LaTeX commands:
-        # \\, \,, \;, \:, \!, \#, \_, \%, \&, \{, \}, etc.
-        if next_char in _ALLOWED_SINGLE_CHAR_LATEX_COMMANDS or next_char.isspace():
-            index += 2
-            continue
-
-        return True
-
-    return False
-
-
-def validate_latex(latex: str, formula_type: str) -> tuple[bool, str]:
-    text = (latex or "").strip()
-
-    if not text:
-        return False, "empty_latex"
-
-    if len(text) > 1500:
-        return False, "latex_too_long"
-
-    if "\ufffd" in text:
-        return False, "replacement_char"
-
-    if _REPEATED_GARBAGE_RE.search(text):
-        return False, "repeated_garbage"
-
-    if not _balanced(text, "{", "}"):
-        return False, "unbalanced_braces"
-
-    if not _balanced(text, "[", "]"):
-        return False, "unbalanced_brackets"
-
-    if not _balanced(text, "(", ")"):
-        return False, "unbalanced_parentheses"
-
-    if _has_broken_latex_command(text):
-        return False, "broken_latex_command"
-
-    # Inline formulas can legitimately be tiny: r, x, EPS, P/E, etc.
-    if formula_type == _INLINE_FORMULA_TYPE and len(text) <= 16:
-        return True, ""
-
-    has_marker = any(marker in text for marker in _LATEX_MARKERS)
-    digit_count = sum(1 for char in text if char.isdigit())
-    operator_count = sum(1 for char in text if char in "=+-*/<>")
-
-    if has_marker or digit_count >= 2 or operator_count >= 1:
-        return True, ""
-
-    words = _WORD_RE.findall(text)
-
-    if len(words) >= 2:
-        return False, "plain_text_like"
-
-    return True, ""
-
-
-# --- 2026-06-11 formula salvage ---------------------------------------------
-# run_043: 56 invalid_latex formulas (18 truncations at the token cap, 23
-# repeated-garbage decode loops, ~15 recognition errors) were dropped by the
-# exporter, scoring 0 for their GT formulas. Most are partially correct; a
-# repaired prefix scores far better than an empty prediction under both edit
-# distance and CDM (a balanced prefix usually still renders). Repair instead
-# of reject.
-
-_TRAILING_HALF_COMMAND_RE = re.compile(r"\\[A-Za-z]*$")
-_BEGIN_ENV_RE = re.compile(r"\\begin\{([A-Za-z*]+)\}")
-_END_ENV_RE = re.compile(r"\\end\{([A-Za-z*]+)\}")
-
-
-def _cut_repeated_garbage(text: str) -> str:
-    """Keep everything up to and including ONE cycle of a detected repeat."""
-    match = _REPEATED_GARBAGE_RE.search(text)
-    if not match:
-        return text
-    return text[: match.start() + len(match.group(1))]
-
-
-def _trim_to_balanced_prefix(text: str) -> str:
-    """
-    Longest prefix where {}, [] and () are all simultaneously balanced.
-    Escaped delimiters (\\{ etc.) are ignored, matching _balanced().
-    """
-    best_end = 0
-    braces = brackets = parens = 0
-    escaped = False
-
-    for index, char in enumerate(text):
-        if escaped:
-            escaped = False
-        elif char == "\\":
-            escaped = True
-        elif char == "{":
-            braces += 1
-        elif char == "}":
-            braces -= 1
-        elif char == "[":
-            brackets += 1
-        elif char == "]":
-            brackets -= 1
-        elif char == "(":
-            parens += 1
-        elif char == ")":
-            parens -= 1
-
-        if braces < 0 or brackets < 0 or parens < 0:
-            break
-
-        if braces == 0 and brackets == 0 and parens == 0 and not escaped:
-            best_end = index + 1
-
-    return text[:best_end].rstrip()
-
-
-def _close_open_environments(text: str) -> str:
-    """Append \\end{env} for every \\begin{env} left open (LIFO order)."""
-    stack: list[str] = []
-    events = sorted(
-        [(m.start(), "begin", m.group(1)) for m in _BEGIN_ENV_RE.finditer(text)]
-        + [(m.start(), "end", m.group(1)) for m in _END_ENV_RE.finditer(text)]
+def _prepare_formula_bboxes_for_mfr(
+    page_image: Image.Image,
+    formula_bboxes: list[dict[str, Any]],
+    config: FormulaExtractionConfig,
+) -> list[dict[str, Any]]:
+    formula_bboxes = _suppress_duplicate_display_formula_bboxes(
+        list(formula_bboxes or [])
     )
-    for _, kind, name in events:
-        if kind == "begin":
-            stack.append(name)
-        elif stack and stack[-1] == name:
-            stack.pop()
-
-    for name in reversed(stack):
-        text += " \\end{" + name + "}"
-
-    return text
-
-
-def _salvage_latex(latex: str, formula_type: str) -> str:
-    """
-    Repair pipeline for LaTeX that failed validate_latex(). Returns the
-    repaired string if it now validates, else "" (caller keeps old behavior).
-    """
-    text = (latex or "").strip()
-    if not text:
-        return ""
-
-    text = _cut_repeated_garbage(text)
-    text = _TRAILING_HALF_COMMAND_RE.sub("", text).rstrip()
-    text = _trim_to_balanced_prefix(text)
-    if not text:
-        return ""
-
-    text = _close_open_environments(text)
-
-    is_valid, _ = validate_latex(text, formula_type)
-    if not is_valid:
-        return ""
-
-    return text
-
-
-# --- end 2026-06-11 formula salvage ------------------------------------------
+    formula_bboxes = _split_display_formula_bboxes(
+        page_image,
+        formula_bboxes,
+        config,
+    )
+    return _suppress_duplicate_display_formula_bboxes(formula_bboxes)
 
 
 def _join_ocr_segments(segments: list[dict[str, Any]]) -> str:
@@ -800,16 +845,6 @@ def _join_ocr_segments(segments: list[dict[str, Any]]) -> str:
 
 def _as_crop_np(crop: Image.Image) -> np.ndarray:
     return np.asarray(crop.convert("RGB"))
-
-
-def _text_similarity(left: str, right: str) -> float:
-    left_clean = re.sub(r"\s+", "", left or "")
-    right_clean = re.sub(r"\s+", "", right or "")
-
-    if not left_clean or not right_clean:
-        return 0.0
-
-    return SequenceMatcher(None, left_clean, right_clean).ratio()
 
 
 def _default_unimernet_onnx_root() -> Path:
@@ -947,9 +982,10 @@ class FormulaMfrExtractor:
         )
 
         logger.info(
-            "Loaded formula MFR model: engine=%s device=%s",
+            "Loaded formula MFR model: engine=%s device=%s trust_model=%s",
             engine_name,
             self.device,
+            self.config.trust_model_output,
         )
 
     def recognize_crop(self, crop: Image.Image) -> dict[str, Any]:
@@ -1004,18 +1040,12 @@ class FormulaMfrExtractor:
         self,
         *,
         artifact: dict[str, Any],
-        crop: Image.Image,
-        bbox_px: list[float],
-        formula_type: str,
         recognized: dict[str, Any],
-        page_image: Image.Image,
-        fallback_ocr: FormulaFallbackOcr | None,
     ) -> None:
         latex = str(recognized.get("latex") or "").strip()
         confidence = _safe_float(recognized.get("confidence"), 0.0)
 
         artifact["latex"] = latex
-        artifact["confidence"] = confidence
         artifact["token_count"] = int(
             _safe_float(recognized.get("token_count"), 0.0)
         )
@@ -1036,127 +1066,17 @@ class FormulaMfrExtractor:
             _safe_float(recognized.get("batch_group_index"), 0.0)
         )
 
+        # Trust the recognizer output: accept whatever LaTeX it produced.
+        # trust_model_output only controls the confidence floor.
+        artifact["status"] = "accepted"
+        artifact["confidence"] = (
+            max(confidence, 0.90) if self.config.trust_model_output else confidence
+        )
+
         if artifact["truncated"]:
             artifact["quality_flags"].append("mfr_truncated")
         elif not artifact["eos_reached"]:
             artifact["quality_flags"].append("mfr_no_eos")
-
-        is_valid, validation_error = validate_latex(latex, formula_type)
-
-        if not is_valid:
-            salvaged = _salvage_latex(latex, formula_type)
-            if salvaged:
-                artifact["latex"] = salvaged
-                artifact["quality_flags"].append(
-                    f"salvaged:{validation_error}"
-                )
-                latex = salvaged
-                is_valid, validation_error = True, ""
-
-        if not is_valid:
-            artifact["status"] = "invalid_latex"
-            artifact["validation_error"] = validation_error
-        elif confidence < self.config.low_confidence:
-            artifact["status"] = "text_fallback"
-        elif confidence < self.config.accept_confidence:
-            artifact["status"] = "low_confidence"
-        else:
-            artifact["status"] = "accepted"
-
-        if artifact["status"] in {"low_confidence", "invalid_latex", "text_fallback"}:
-            consensus = self._maybe_run_self_consensus(
-                page_image=page_image,
-                bbox_px=bbox_px,
-                first_latex=latex,
-                first_confidence=confidence,
-            )
-
-            if consensus:
-                artifact.update(consensus)
-
-                consensus_latex = str(consensus.get("consensus_latex") or "")
-                consensus_confidence = _safe_float(
-                    consensus.get("consensus_confidence"), 0.0
-                )
-                consensus_similarity = _safe_float(
-                    consensus.get("consensus_similarity"), 0.0
-                )
-
-                consensus_valid, consensus_error = validate_latex(
-                    consensus_latex,
-                    formula_type,
-                )
-
-                if not consensus_valid:
-                    artifact["quality_flags"].append(
-                        f"consensus_invalid: {consensus_error}"
-                    )
-
-                if (
-                    consensus_valid
-                    and consensus_similarity >= self.config.consensus_similarity_threshold
-                    and consensus_confidence > confidence
-                ):
-                    artifact["latex"] = consensus_latex
-                    artifact["confidence"] = consensus_confidence
-
-                    if consensus_confidence >= self.config.accept_confidence:
-                        artifact["status"] = "accepted"
-                        artifact["validation_error"] = ""
-                    elif consensus_confidence >= self.config.low_confidence:
-                        artifact["status"] = "low_confidence"
-                        artifact["validation_error"] = ""
-
-        if artifact["status"] in {"invalid_latex", "text_fallback"} and fallback_ocr is not None:
-            try:
-                segments = fallback_ocr(_as_crop_np(crop))
-                artifact["fallback_text"] = _join_ocr_segments(segments)
-            except Exception as exc:
-                artifact["quality_flags"].append(f"fallback_ocr_failed: {exc}")
-
-    def _maybe_run_self_consensus(
-        self,
-        *,
-        page_image: Image.Image,
-        bbox_px: list[float],
-        first_latex: str,
-        first_confidence: float,
-    ) -> dict[str, Any]:
-        if not self.config.enable_self_consensus:
-            return {}
-
-        crop, crop_bbox_px = _crop_formula_image(
-            page_image,
-            bbox_px,
-            self.config,
-            padding_ratio=self.config.consensus_padding_ratio,
-        )
-
-        if crop is None:
-            return {
-                "consensus_used": False,
-                "consensus_error": "consensus_crop_empty",
-            }
-
-        try:
-            second = self.recognize_crop(crop)
-        except Exception as exc:
-            return {
-                "consensus_used": False,
-                "consensus_error": f"consensus_mfr_error: {exc}",
-            }
-
-        second_latex = str(second.get("latex") or "").strip()
-        second_confidence = _safe_float(second.get("confidence"), 0.0)
-        similarity = _text_similarity(first_latex, second_latex)
-
-        return {
-            "consensus_used": True,
-            "consensus_latex": second_latex,
-            "consensus_confidence": second_confidence,
-            "consensus_similarity": similarity,
-            "consensus_crop_bbox_px": crop_bbox_px,
-        }
 
     def extract(
         self,
@@ -1171,12 +1091,13 @@ class FormulaMfrExtractor:
         if page_image is None:
             return []
 
+        if self.config.trust_model_output or not self.config.enable_fallback_ocr:
+            fallback_ocr = None
+
         artifacts: list[dict[str, Any]] = []
         pending_mfr: list[tuple[dict[str, Any], Image.Image, str, list[float]]] = []
 
-        # 2026-06-11 display-formula splitter: expand merged PP-DocLayoutV3
-        # display boxes into one bbox per equation BEFORE cropping/MFR.
-        formula_bboxes = _split_display_formula_bboxes(
+        formula_bboxes = _prepare_formula_bboxes_for_mfr(
             page_image,
             list(formula_bboxes or []),
             self.config,
@@ -1202,6 +1123,7 @@ class FormulaMfrExtractor:
                 "crop_bbox_px": None,
                 "crop_debug_path": "",
                 "layout_score": _safe_float(formula.get("score"), 0.0),
+                "preserve_display_group": bool(formula.get("preserve_display_group")),
                 "fallback_text": "",
                 "validation_error": "",
                 "consensus_used": False,
@@ -1297,12 +1219,7 @@ class FormulaMfrExtractor:
                 ), recognized in zip(pending_mfr, recognized_items):
                     self._apply_recognition_result(
                         artifact=artifact,
-                        crop=crop,
-                        bbox_px=bbox_px,
-                        formula_type=formula_type,
                         recognized=recognized,
-                        page_image=page_image,
-                        fallback_ocr=fallback_ocr,
                     )
 
         return artifacts

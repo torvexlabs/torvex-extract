@@ -106,3 +106,140 @@ def test_formula_extraction_uses_runtime_batch_api():
     ]
     assert artifacts[0]["latex"] == "x=1"
     assert artifacts[0]["mfr_batch_size"] == 1
+
+
+def test_formula_extraction_suppresses_display_parent_duplicates():
+    class FakeRuntime:
+        def __init__(self):
+            self.calls = []
+
+        def recognize_batch(self, imgs, *, max_batch_size, sort_by_size):
+            self.calls.append(len(imgs))
+            return [
+                {
+                    "latex": "x=1",
+                    "token_count": 1,
+                    "last_token": 2,
+                    "eos_reached": True,
+                    "truncated": False,
+                    "elapsed_ms": 10.0,
+                    "ms_per_token": 10.0,
+                    "batch_size": len(imgs),
+                    "batch_group_index": 0,
+                    "active_providers": {"encoder": ["CPUExecutionProvider"]},
+                    "io_binding": False,
+                }
+                for _ in imgs
+            ]
+
+    fake_runtime = FakeRuntime()
+    extractor = formula_extractor.FormulaMfrExtractor()
+    extractor._ocr = fake_runtime
+
+    img_np = np.full((120, 220, 3), 255, dtype=np.uint8)
+    img_np[20:40, 30:120] = 0
+    img_np[60:80, 30:120] = 0
+
+    artifacts = extractor.extract(
+        img_np=img_np,
+        formula_bboxes=[
+            {
+                "formula_id": "parent",
+                "type": "display_formula",
+                "bbox_px": [10, 10, 190, 95],
+                "score": 0.9,
+            },
+            {
+                "formula_id": "child_a",
+                "type": "display_formula",
+                "bbox_px": [25, 15, 130, 45],
+                "score": 0.8,
+            },
+            {
+                "formula_id": "child_b",
+                "type": "display_formula",
+                "bbox_px": [25, 55, 130, 85],
+                "score": 0.8,
+            },
+        ],
+        page_num=0,
+    )
+
+    assert fake_runtime.calls == [2]
+    assert [artifact["formula_id"] for artifact in artifacts] == [
+        "child_a",
+        "child_b",
+    ]
+
+
+def test_formula_extraction_preserves_strong_display_parent_over_fragments():
+    class FakeRuntime:
+        def __init__(self):
+            self.calls = []
+
+        def recognize_batch(self, imgs, *, max_batch_size, sort_by_size):
+            self.calls.append(len(imgs))
+            return [
+                {
+                    "latex": "x=1",
+                    "token_count": 1,
+                    "last_token": 2,
+                    "eos_reached": True,
+                    "truncated": False,
+                    "elapsed_ms": 10.0,
+                    "ms_per_token": 10.0,
+                    "batch_size": len(imgs),
+                    "batch_group_index": 0,
+                    "active_providers": {"encoder": ["CPUExecutionProvider"]},
+                    "io_binding": False,
+                }
+                for _ in imgs
+            ]
+
+    fake_runtime = FakeRuntime()
+    extractor = formula_extractor.FormulaMfrExtractor()
+    extractor._ocr = fake_runtime
+
+    img_np = np.full((220, 240, 3), 255, dtype=np.uint8)
+    img_np[20:40, 30:200] = 0
+    img_np[80:100, 30:200] = 0
+    img_np[140:160, 30:200] = 0
+
+    artifacts = extractor.extract(
+        img_np=img_np,
+        formula_bboxes=[
+            {
+                "formula_id": "parent",
+                "type": "display_formula",
+                "bbox_px": [10, 10, 220, 180],
+                "score": 0.72,
+            },
+            {
+                "formula_id": "child_a",
+                "type": "display_formula",
+                "bbox_px": [25, 15, 205, 45],
+                "score": 0.36,
+            },
+            {
+                "formula_id": "child_b",
+                "type": "display_formula",
+                "bbox_px": [25, 75, 205, 105],
+                "score": 0.40,
+            },
+            {
+                "formula_id": "child_c",
+                "type": "display_formula",
+                "bbox_px": [25, 135, 205, 165],
+                "score": 0.38,
+            },
+        ],
+        page_num=0,
+    )
+
+    assert fake_runtime.calls == [4]
+    assert [artifact["formula_id"] for artifact in artifacts] == [
+        "parent",
+        "child_a",
+        "child_b",
+        "child_c",
+    ]
