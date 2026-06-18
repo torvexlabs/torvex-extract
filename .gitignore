@@ -23,3 +23,5 @@ models/
 
 # Local patch backups
 *.bak_*
+.bench/
+tools/omnidocbench_eval/official_tools
