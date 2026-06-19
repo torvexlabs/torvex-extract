@@ -944,8 +944,12 @@ def process_layout_zones(
     """
     zones = filter_zones_by_confidence(zones)
     zones = suppress_duplicate_zones(zones)
-    zones = suppress_nested_formula_containers(zones)
-    zones = suppress_inline_inside_display(zones)
+    # Formula-zone suppression (b7749e2) regressed formula CDM 0.80 (run_016) ->
+    # 0.66 by dropping ~25% of display_formula zones (rules 2/3 delete real
+    # stacked/short equations). Gate it so we can A/B and recover.
+    if os.getenv("TORVEX_FORMULA_SUPPRESS", "true").strip().lower() in {"1", "true", "yes", "on"}:
+        zones = suppress_nested_formula_containers(zones)
+        zones = suppress_inline_inside_display(zones)
     zones = mark_unsafe_container_zones(zones)
     zones = order_zones_for_reading(zones, is_tagged=is_tagged)
 
