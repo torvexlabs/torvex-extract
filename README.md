@@ -308,4 +308,4 @@ Torvex Extract is licensed under the Apache License 2.0. See [LICENSE](LICENSE).
 
 ## Maintainer
 
-Built by [Torvex Labs](https://github.com/torvexlabs).
+Built and maintained by [Sibisrinivas B](https://github.com/sibisrinivasb) as part of [Torvex Labs](https://github.com/torvexlabs).
