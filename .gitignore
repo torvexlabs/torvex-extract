@@ -21,7 +21,13 @@ results/smoke/
 
 models/
 
+# Raw GT-vs-detection overlays (1651 page images)
+overlays_gt_vs_ppdoclayout/
+overlays_v16_gt_vs_ppdoclayout/
+
 # Local patch backups
 *.bak_*
 .bench/
 tools/omnidocbench_eval/official_tools
+
+overlays_v16_worst/
