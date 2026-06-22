@@ -18,6 +18,13 @@ from ppdoclayout_formula_detection_eval import poly_to_xyxy
 GT_CAT, DISP = "equation_isolated", "display_formula"
 
 
+def display_like_inline(box, page_h, min_frac):
+    """Display-like inline = tall enough relative to the page. Genuine embedded inline math is small
+    (~<=1.4% of page height); misclassified display formulas are >=~1.5%. Page-fraction is
+    resolution-independent (text-line height is unreliable: PP zones are paragraph blocks)."""
+    return page_h > 0 and (box[3] - box[1]) >= min_frac * page_h
+
+
 def drop_contained_boxes(boxes, ratio=0.7):
     def area(b):
         return max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
@@ -47,8 +54,13 @@ def main():
     ap.add_argument("--only-pages", type=Path, default=None,
                     help="JSON list of image names to restrict to (e.g. docker GT formula pages)")
     ap.add_argument("--include-inline", action="store_true",
-                    help="also recognize inline_formula boxes; drop-inner-keep-outer across the COMBINED "
+                    help="also recognize ALL inline_formula boxes; drop-inner-keep-outer across the COMBINED "
                          "set removes any inline nested inside a display (or larger) box")
+    ap.add_argument("--promote-inline", action="store_true",
+                    help="recognize display + only display-like inline boxes (tall relative to the page); "
+                         "targeted recovery of wrong-class formulas without the full inline flood")
+    ap.add_argument("--inline-min-frac", type=float, default=0.015,
+                    help="min inline-box height as fraction of page height to promote (default 0.015 = 1.5%%)")
     args = ap.parse_args()
     only_pages = set(json.loads(args.only_pages.read_text(encoding="utf-8"))) if args.only_pages else None
 
@@ -85,8 +97,15 @@ def main():
             bgr = np.array(img)[:, :, ::-1].copy()
         except Exception:
             continue
-        keep_types = {DISP, "inline_formula"} if args.include_inline else {DISP}
-        boxes = [tuple(z["bbox"]) for z in engine.detect_layout(bgr) if z.get("type") in keep_types]
+        zones = engine.detect_layout(bgr)
+        disp = [tuple(z["bbox"]) for z in zones if z.get("type") == DISP]
+        if args.promote_inline:
+            inl = [tuple(z["bbox"]) for z in zones if z.get("type") == "inline_formula"]
+            boxes = disp + [b for b in inl if display_like_inline(b, img.height, args.inline_min_frac)]
+        elif args.include_inline:
+            boxes = disp + [tuple(z["bbox"]) for z in zones if z.get("type") == "inline_formula"]
+        else:
+            boxes = disp
         if not args.no_dedup:
             boxes = drop_contained_boxes(boxes)   # inline nested in display (or larger) is dropped here
         boxes.sort(key=lambda b: (round(b[1] / 10), b[0]))      # reading order: top->bottom, left->right
