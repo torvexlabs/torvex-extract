@@ -577,127 +577,6 @@ _FORMULA_CONTAINER_CHILD_CONTAINMENT = 0.75
 _FORMULA_REDUNDANT_CHILD_CONTAINMENT = 0.90
 
 
-def suppress_nested_formula_containers(zones: list[dict]) -> list[dict]:
-    """
-    Drop display_formula zones that are redundant due to nesting.
-
-    Two rules (both apply only within the display_formula type):
-
-    Rule 1 — container removal:
-      A large zone that has >= 2 other zones each >= 75% inside it is a merged
-      container; drop the outer zone, keep the inner ones.
-
-    Rule 2 — redundant child removal:
-      A smaller zone that is >= 90% inside a larger zone is a spurious sub-detection;
-      drop the smaller zone, keep the larger one.
-    """
-    formula_zones = [z for z in zones if z.get("type") == "display_formula" and "bbox_px" in z]
-    if len(formula_zones) < 2:
-        return zones
-
-    def area(b: list) -> float:
-        return max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
-
-    drop: set[int] = set()
-
-    # Rule 1: containers with 2+ children
-    for i, outer in enumerate(formula_zones):
-        if id(outer) in drop:
-            continue
-        children = 0
-        for j, inner in enumerate(formula_zones):
-            if i == j or id(inner) in drop:
-                continue
-            if _containment_ratio(inner["bbox_px"], outer["bbox_px"]) >= _FORMULA_CONTAINER_CHILD_CONTAINMENT:
-                children += 1
-                if children >= _FORMULA_CONTAINER_MIN_CHILDREN:
-                    break
-        if children >= _FORMULA_CONTAINER_MIN_CHILDREN:
-            drop.add(id(outer))
-            logger.debug("suppress_nested_formula_containers rule1: drop container %s", outer["bbox_px"])
-
-    # Rule 2: smaller zone >90% inside a larger zone
-    for i, small in enumerate(formula_zones):
-        if id(small) in drop:
-            continue
-        for j, large in enumerate(formula_zones):
-            if i == j or id(large) in drop:
-                continue
-            if area(large["bbox_px"]) <= area(small["bbox_px"]):
-                continue
-            if _containment_ratio(small["bbox_px"], large["bbox_px"]) >= _FORMULA_REDUNDANT_CHILD_CONTAINMENT:
-                drop.add(id(small))
-                logger.debug("suppress_nested_formula_containers rule2: drop child %s inside %s", small["bbox_px"], large["bbox_px"])
-                break
-
-    # Rule 3: tiny subscript zone (area < 2000 px²) whose x-range is fully inside a
-    # larger zone and whose top edge starts within that larger zone's y-range.
-    # PP-DocLayoutV3 sometimes fires a separate display_formula for the "i=1,2,...,n"
-    # subscript that visually hangs just below a main formula but whose top pixel
-    # overlaps the main zone — too small to be caught by Rule 2's 90% containment.
-    _SUBSCRIPT_MAX_AREA = 2000
-    for i, small in enumerate(formula_zones):
-        if id(small) in drop:
-            continue
-        sb = small["bbox_px"]
-        if area(sb) >= _SUBSCRIPT_MAX_AREA:
-            continue
-        for j, large in enumerate(formula_zones):
-            if i == j or id(large) in drop:
-                continue
-            lb = large["bbox_px"]
-            if area(lb) <= area(sb):
-                continue
-            x_inside = sb[0] >= lb[0] and sb[2] <= lb[2]
-            y0_inside = lb[1] <= sb[1] <= lb[3]
-            if x_inside and y0_inside:
-                drop.add(id(small))
-                logger.debug("suppress_nested_formula_containers rule3: drop subscript %s inside %s", sb, lb)
-                break
-
-    if not drop:
-        return zones
-
-    return [z for z in zones if id(z) not in drop]
-
-
-# inline_formula is dropped when this much of it sits inside a display_formula.
-_INLINE_IN_DISPLAY_CONTAINMENT = 0.75
-
-
-def suppress_inline_inside_display(zones: list[dict]) -> list[dict]:
-    """
-    Drop inline_formula zones that are mostly inside a display_formula zone.
-
-    PP-DocLayoutV3 sometimes fires inline_formula detections inside a region it
-    has already labelled display_formula.  The display zone is authoritative;
-    the inline zones are redundant and would produce double-processing in the
-    extraction pipeline.
-    """
-    display_zones = [z for z in zones if z.get("type") == "display_formula" and "bbox_px" in z]
-    if not display_zones:
-        return zones
-
-    drop: set[int] = set()
-    for zone in zones:
-        if zone.get("type") != "inline_formula" or "bbox_px" not in zone:
-            continue
-        for dz in display_zones:
-            if _containment_ratio(zone["bbox_px"], dz["bbox_px"]) >= _INLINE_IN_DISPLAY_CONTAINMENT:
-                drop.add(id(zone))
-                logger.debug(
-                    "suppress_inline_inside_display: drop inline %s inside display %s",
-                    zone["bbox_px"],
-                    dz["bbox_px"],
-                )
-                break
-
-    if not drop:
-        return zones
-
-    return [z for z in zones if id(z) not in drop]
-
-
 def _containment_ratio(
     inner_box: list[float],
     outer_box: list[float],
@@ -944,12 +823,10 @@ def process_layout_zones(
     """
     zones = filter_zones_by_confidence(zones)
     zones = suppress_duplicate_zones(zones)
-    # Formula-zone suppression (b7749e2) regressed formula CDM 0.80 (run_016) ->
-    # 0.66 by dropping ~25% of display_formula zones (rules 2/3 delete real
-    # stacked/short equations). Gate it so we can A/B and recover.
-    if os.getenv("TORVEX_FORMULA_SUPPRESS", "true").strip().lower() in {"1", "true", "yes", "on"}:
-        zones = suppress_nested_formula_containers(zones)
-        zones = suppress_inline_inside_display(zones)
+    # Formula-zone selection (drop-inner-keep-outer + display-like inline promotion) now
+    # happens in the formula extractor via formula_pipeline.select_formula_boxes. Do NOT
+    # pre-suppress formula zones here, or the extractor can't see them (the old
+    # suppress_nested/inline regressed CDM by deleting real stacked/short equations).
     zones = mark_unsafe_container_zones(zones)
     zones = order_zones_for_reading(zones, is_tagged=is_tagged)
 
