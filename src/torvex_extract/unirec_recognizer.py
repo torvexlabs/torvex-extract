@@ -28,7 +28,8 @@ logger = logging.getLogger(__name__)
 
 # src/torvex_extract/unirec_recognizer.py -> repo root is parents[2]
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_MODEL_DIR = _REPO_ROOT / "models" / "unirec-0.1b-onnx"
+# TORVEX_UNIREC_MODEL_DIR lets you swap weight variants (e.g. the fp16 / int8 build) without code change.
+DEFAULT_MODEL_DIR = Path(os.getenv("TORVEX_UNIREC_MODEL_DIR", str(_REPO_ROOT / "models" / "unirec-0.1b-onnx")))
 
 
 class _ImageProcessor:
@@ -121,6 +122,28 @@ class UniRecRecognizer:
         self.processor = _ImageProcessor()
         self.tokenizer = _Tokenizer(mapping)
         self.max_length = max_length
+        # no-repeat-ngram: ban any n-gram of token ids from recurring in the greedy decode.
+        # Phrase-repetition loops on hard/ambiguous formula crops (e.g. a "{r+1}\\"-style cycle
+        # repeating to max_length) slip past the low-diversity guard because the cycle has >4
+        # distinct tokens. Banning the repeated n-gram forces the decode off the loop. 0 disables.
+        try:
+            self._no_repeat_ngram = max(0, int(os.getenv("TORVEX_UNIREC_NO_REPEAT_NGRAM", "4")))
+        except Exception:
+            self._no_repeat_ngram = 4
+
+        # CUDA arena shrinkage: free the arena after the (variable-size) encoder run so VRAM
+        # doesn't ratchet up to the largest crop ever seen. The model is stateless across crops,
+        # so per-crop flush is safe; capped VRAM ~28x lower with negligible latency cost.
+        self._run_options = None
+        if any("CUDA" in p for p in providers):
+            self._run_options = ort.RunOptions()
+            self._run_options.add_run_config_entry("memory.enable_memory_arena_shrinkage", "gpu:0")
+
+        # float dtype the model expects (float32 or, for the quantized build, float16)
+        enc_in = {i.name: i.type for i in self.encoder_session.get_inputs()}
+        dec_in = {i.name: i.type for i in self.decoder_session.get_inputs()}
+        self._pix_dtype = np.float16 if "float16" in enc_in.get("pixel_values", "") else np.float32
+        self._fdtype = np.float16 if "float16" in dec_in.get("cross_k", "") else np.float32
 
         self.num_decoder_layers = 0
         self.num_heads = None
@@ -154,24 +177,35 @@ class UniRecRecognizer:
         return out
 
     def _encode(self, image: Image.Image):
-        pixel_values = self.processor(image)
-        enc = self.encoder_session.run(None, {"pixel_values": pixel_values})
+        pixel_values = self.processor(image).astype(self._pix_dtype)
+        enc = self.encoder_session.run(None, {"pixel_values": pixel_values}, self._run_options)
         return enc[0], enc[1], enc[2]  # hidden, cross_k, cross_v
 
     def _decode_step(self, input_id, past_length, cross_k, cross_v, past_kv, padding_idx):
         decoder_inputs = {
             "input_ids": np.array([[input_id]], dtype=np.int64),
             "position_ids": np.array([[padding_idx + 1 + past_length]], dtype=np.int64),
-            "cross_k": cross_k.astype(np.float32),
-            "cross_v": cross_v.astype(np.float32),
+            "cross_k": cross_k.astype(self._fdtype),
+            "cross_v": cross_v.astype(self._fdtype),
         }
         for i, (pk, pv) in enumerate(past_kv):
-            decoder_inputs[f"past_key_{i}"] = pk.astype(np.float32)
-            decoder_inputs[f"past_value_{i}"] = pv.astype(np.float32)
+            decoder_inputs[f"past_key_{i}"] = pk.astype(self._fdtype)
+            decoder_inputs[f"past_value_{i}"] = pv.astype(self._fdtype)
         outs = self.decoder_session.run(None, decoder_inputs)
         logits = outs[0]
         present = [(outs[1 + i * 2], outs[1 + i * 2 + 1]) for i in range(self.num_decoder_layers)]
         return logits, present
+
+    def _banned_ngram_tokens(self, generated, n):
+        """Tokens that would complete an n-gram already seen in `generated` (no-repeat-ngram)."""
+        if n <= 1 or len(generated) < n:
+            return ()
+        prefix = tuple(generated[-(n - 1):])
+        banned = set()
+        for i in range(len(generated) - n + 1):
+            if tuple(generated[i:i + n - 1]) == prefix:
+                banned.add(generated[i + n - 1])
+        return banned
 
     def _infer(self, image: Image.Image) -> str:
         bos, eos, pad = (self.tokenizer.bos_token_id,
@@ -179,15 +213,25 @@ class UniRecRecognizer:
                          self.tokenizer.pad_token_id)
         enc_hidden, cross_k, cross_v = self._encode(image)
         batch = enc_hidden.shape[0]
-        past_kv = [(np.zeros((batch, self.num_heads, 0, self.head_dim), dtype=np.float32),
-                    np.zeros((batch, self.num_heads, 0, self.head_dim), dtype=np.float32))
+        past_kv = [(np.zeros((batch, self.num_heads, 0, self.head_dim), dtype=self._fdtype),
+                    np.zeros((batch, self.num_heads, 0, self.head_dim), dtype=self._fdtype))
                    for _ in range(self.num_decoder_layers)]
         generated = [bos]
         for step in range(self.max_length - 1):
             logits, past_kv = self._decode_step(
                 generated[-1], step, cross_k, cross_v, past_kv, padding_idx=pad)
-            nxt = int(np.argmax(logits[0, -1, :]))
+            scores = logits[0, -1, :]
+            banned = self._banned_ngram_tokens(generated, self._no_repeat_ngram)
+            if banned:
+                scores = scores.copy()
+                scores[list(banned)] = -np.inf
+            nxt = int(np.argmax(scores))
             generated.append(nxt)
             if nxt == eos:
+                break
+            # repetition/degeneracy guard: greedy decode can fall into a loop (e.g. a run of
+            # "----" to max_length, a 245s page). If the last window has <=4 distinct tokens it's
+            # degenerate -> stop. Natural text/latex has many distinct tokens in any 48-token span.
+            if step >= 48 and len(set(generated[-48:])) <= 4:
                 break
         return clean_special_tokens(self.tokenizer.decode(generated)).strip()
