@@ -5,6 +5,7 @@ from typing import Any
 
 import cv2
 import numpy as np
+import onnxruntime as ort
 
 from torvex_extract.onnx_runtime import create_onnx_session
 
@@ -170,6 +171,18 @@ class PPOCRV6SmallOCR:
             providers=providers,
             model_name="PP-OCRv6 small recognizer",
         )
+
+        # CUDA arena shrinkage: PP-OCR feeds variable-size det (up to det_max_long_side_px)
+        # and rec (up to rec_max_width) inputs, so the ORT CUDA arena ratchets up to the
+        # largest page seen (observed ~6.6GB peak over a full run). Shrinking the arena after
+        # each run caps it (~237MB) with no quality/latency cost; the sessions are stateless
+        # across pages so a per-run flush is safe. Gated to CUDA providers.
+        self._run_options = None
+        if any("CUDA" in provider for provider in providers):
+            self._run_options = ort.RunOptions()
+            self._run_options.add_run_config_entry(
+                "memory.enable_memory_arena_shrinkage", "gpu:0"
+            )
 
         self.det_input_name = self.det_session.get_inputs()[0].name
         self.rec_input_name = self.rec_session.get_inputs()[0].name
@@ -366,7 +379,7 @@ class PPOCRV6SmallOCR:
     def _detect_text_boxes(self, image_np: np.ndarray) -> list[dict[str, Any]]:
         original_h, original_w = image_np.shape[:2]
         det_input, _, _ = self._preprocess_det(image_np)
-        output = self.det_session.run(None, {self.det_input_name: det_input})[0]
+        output = self.det_session.run(None, {self.det_input_name: det_input}, self._run_options)[0]
         pred = output[0, 0]
 
         return _sort_text_boxes(
@@ -499,7 +512,7 @@ class PPOCRV6SmallOCR:
         if rec_input is None:
             return "", 0.0
 
-        logits = self.rec_session.run(None, {self.rec_input_name: rec_input})[0][0]
+        logits = self.rec_session.run(None, {self.rec_input_name: rec_input}, self._run_options)[0][0]
         return self._decode_recognition(logits)
 
     def _recognize_crops(
@@ -538,6 +551,7 @@ class PPOCRV6SmallOCR:
             logits_batch = self.rec_session.run(
                 None,
                 {self.rec_input_name: batch},
+                self._run_options,
             )[0]
 
             for (original_index, _), logits in zip(chunk, logits_batch):
