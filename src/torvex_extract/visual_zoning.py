@@ -7,6 +7,7 @@ from pathlib import Path
 from PIL import Image
 
 import numpy as np
+import onnxruntime as ort
 
 from torvex_extract.onnx_runtime import create_onnx_session, select_onnx_providers
 from torvex_extract.ppocrv6_ocr import PPOCRV6SmallOCR, PPOCRV6_SMALL_BACKEND
@@ -1289,6 +1290,7 @@ class TorvexExtractEngine:
     def __init__(self):
         self._layout = None
         self._tatr = None
+        self._tatr_run_options = None
         self._ocr = None
         self._ocr_backend = "onnxtr_fast_base"
         self._providers = None
@@ -1315,6 +1317,18 @@ class TorvexExtractEngine:
             providers=self._providers,
             model_name="TATR",
         )
+
+        # CUDA arena shrinkage for TATR only: its input H/W are fully dynamic, so a large
+        # table crop ratchets the ORT CUDA arena up and it stays resident. Shrinking after each
+        # run caps it with no quality cost; TATR runs once per table (not per text-line) so the
+        # re-alloc cost is negligible. NOT applied to PP-DocLayout (self._layout): its input is
+        # fixed 800x800, so its arena never grows -> shrinkage would only add per-page churn.
+        self._tatr_run_options = None
+        if any("CUDA" in provider for provider in self._providers):
+            self._tatr_run_options = ort.RunOptions()
+            self._tatr_run_options.add_run_config_entry(
+                "memory.enable_memory_arena_shrinkage", "gpu:0"
+            )
 
         # 2026-05-27:
         # OCR routing is page-level in pypdfium_extractor.py.
@@ -1423,6 +1437,7 @@ class TorvexExtractEngine:
         raw_output = self._tatr.run(
             None,
             {"pixel_values": blob},
+            self._tatr_run_options,
         )
 
         return parse_tatr_output(raw_output, scale_h, scale_w)
@@ -1506,6 +1521,7 @@ class TorvexExtractEngine:
         """
         self._layout = None
         self._tatr = None
+        self._tatr_run_options = None
         self._ocr = None
         self._ocr_backend = "onnxtr_fast_base"
         self._providers = None
