@@ -31,3 +31,8 @@ overlays_v16_gt_vs_ppdoclayout/
 tools/omnidocbench_eval/official_tools
 
 overlays_v16_worst/
+
+# OmniDocBench/CDM debug artifacts
+cdm_106_debug/
+overlay_display_gt_cdm_296/
+overlay_r0_gt_cdm_296/
