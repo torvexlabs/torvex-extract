@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from html import escape
 from pathlib import Path
 from typing import Any
@@ -42,21 +43,43 @@ def table_rows_to_html(rows: list[list[Any]]) -> str:
     return "\n".join(lines)
 
 
-def formula_to_markdown(formula: dict[str, Any]) -> str:
-    formula_type = str(formula.get("type") or "")
-    status = str(formula.get("status") or "")
-    latex = clean_latex(formula.get("latex"))
+# Seg-split: a unified recognizer (UniRec) emits a multi-line crop as several delimited
+# segments in ONE latex string (\[a\]\[b\]\[c\]). Collapsing them into one $$ block makes the
+# matcher pair only the first line and drop the rest -> emit one $$ per delimited segment. This
+# is the granularity fix the formula score depends on. Kept self-contained here (mirroring
+# converter.py) so the benchmark harness stays stable.
+_SEG = re.compile(r"\\\[(.*?)\\\]|\\\((.*?)\\\)|\$\$(.*?)\$\$", re.DOTALL)
 
-    if formula_type != "display_formula":
-        return ""
 
-    if status not in {"accepted", "low_confidence"}:
-        return ""
+def _split_segments(content: str) -> list[str]:
+    segs = [
+        next(g for g in m.groups() if g is not None).strip()
+        for m in _SEG.finditer(content or "")
+    ]
+    segs = [s for s in segs if s]
+    return segs if len(segs) >= 2 else []
 
-    if not latex:
-        return ""
 
-    return f"$$\n{latex}\n$$"
+def formula_emittable(formula: dict[str, Any]) -> bool:
+    if str(formula.get("type") or "") != "display_formula":
+        return False
+
+    if str(formula.get("status") or "") not in {"accepted", "low_confidence"}:
+        return False
+
+    return bool(clean_text(formula.get("latex")))
+
+
+def formula_markdown_blocks(formula: dict[str, Any]) -> list[str]:
+    """One $$ block per equation. Applies seg-split so a multi-segment recognizer
+    output becomes per-equation blocks (the granularity the matcher wants)."""
+    if not formula_emittable(formula):
+        return []
+
+    raw = clean_text(formula.get("latex"))
+    bodies = _split_segments(raw) or [clean_latex(raw)]
+
+    return [f"$$\n{body}\n$$" for body in bodies if body]
 
 
 def bbox(value: Any) -> list[float] | None:
@@ -168,7 +191,7 @@ def formula_indexes_for_zone(
         if index in used:
             continue
 
-        if not formula_to_markdown(formula):
+        if not formula_emittable(formula):
             continue
 
         fbox = formula_bbox(formula)
@@ -204,9 +227,7 @@ def fallback_page_to_markdown(page: dict[str, Any]) -> str:
         blocks.append(text)
 
     for formula in page.get("formulas") or []:
-        formula_md = formula_to_markdown(formula)
-        if formula_md:
-            blocks.append(formula_md)
+        blocks.extend(formula_markdown_blocks(formula))
 
     for table in page.get("tables") or []:
         table_html = table_rows_to_html(table.get("rows") or [])
@@ -235,7 +256,6 @@ def normalized_page_to_markdown(page: dict[str, Any]) -> str:
         "header_image",
         "footer_image",
         "seal",
-        "inline_formula",
         "formula_number",
     }
 
@@ -254,12 +274,13 @@ def normalized_page_to_markdown(page: dict[str, Any]) -> str:
                     used_tables.add(table_index)
             continue
 
-        if zone_type == "display_formula":
+        if zone_type in {"display_formula", "inline_formula"}:
+            # display_formula zones, plus inline_formula zones that carry a recognized
+            # (display-like, promoted) formula -> emit as display $$ blocks in reading
+            # order. Plain inline zones with no recognized formula emit nothing.
             for formula_index in formula_indexes_for_zone(zone, formulas, used_formulas):
-                formula_md = formula_to_markdown(formulas[formula_index])
-                if formula_md:
-                    blocks.append(formula_md)
-                    used_formulas.add(formula_index)
+                blocks.extend(formula_markdown_blocks(formulas[formula_index]))
+                used_formulas.add(formula_index)
             continue
 
         zone_text = clean_text(
@@ -282,9 +303,7 @@ def normalized_page_to_markdown(page: dict[str, Any]) -> str:
         for formula_index, formula in enumerate(formulas):
             if formula_index in used_formulas:
                 continue
-            formula_md = formula_to_markdown(formula)
-            if formula_md:
-                blocks.append(formula_md)
+            blocks.extend(formula_markdown_blocks(formula))
 
     for table_index, table in enumerate(tables):
         if table_index in used_tables:

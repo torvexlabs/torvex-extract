@@ -337,6 +337,15 @@ def clean_run_dirs(*dirs: Path) -> None:
 
 
 def main() -> int:
+    # OmniDocBench image filenames contain CJK characters. On Windows, a redirected
+    # stdout defaults to cp1252 and the per-page progress print() raises
+    # UnicodeEncodeError mid-run. Force UTF-8 so the run can't die on a filename.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
     parser = argparse.ArgumentParser(
         description="Run Torvex on an OmniDocBench subset and export prediction markdown."
     )
