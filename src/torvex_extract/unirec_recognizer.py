@@ -8,9 +8,16 @@ numpy / onnxruntime / PIL, no torch/transformers/cv2).
 Exposes recognize_crops(crops) -> [{"latex": str}].
 
 Assets (models/unirec-0.1b-onnx/): unirec_encoder.onnx, unirec_decoder.onnx,
-unirec_tokenizer_mapping.json. Greedy decode (max_length 2048); preprocess = resize
-max 960x1408 down to /64 multiples, BICUBIC, normalize mean/std 0.5. The clean_special_tokens
-rules below are defensive (no <|sn|> token actually exists in this vocab).
+unirec_tokenizer_mapping.json. Preprocess = resize max 960x1408 down to /64 multiples,
+BICUBIC, normalize mean/std 0.5. The clean_special_tokens rules below are defensive
+(no <|sn|> token actually exists in this vocab).
+
+VELOX (added 2026-06-28): when unirec_decoder_velox.onnx is present, decode runs n-gram
+self-speculative decoding (draft from the model's own output, verify K tokens in one
+multi-token pass, roll back the KV on a miss). It is LOSSLESS — byte-identical to greedy —
+and ~1.7x faster on formula-dense content (formulas legitimately repeat structure, so the
+n-gram drafts hit). Toggle with TORVEX_UNIREC_VELOX (default on); falls back to single-token
+greedy when the velox decoder is absent, disabled, or no-repeat-ngram is in use.
 """
 from __future__ import annotations
 
@@ -99,11 +106,46 @@ class UniRecRecognizer:
     def __init__(self, model_dir=DEFAULT_MODEL_DIR, device="gpu", max_length=2048):
         model_dir = Path(model_dir)
         enc = str(model_dir / "unirec_encoder.onnx")
-        dec = str(model_dir / "unirec_decoder.onnx")
+        base_dec = str(model_dir / "unirec_decoder.onnx")
+        velox_dec = str(model_dir / "unirec_decoder_velox.onnx")
         mapping = str(model_dir / "unirec_tokenizer_mapping.json")
-        for p in (enc, dec, mapping):
+        for p in (enc, base_dec, mapping):
             if not os.path.exists(p):
                 raise FileNotFoundError(f"UniRec asset missing: {p}")
+
+        self.max_length = max_length
+        # no-repeat-ngram: ban any n-gram of token ids from recurring in the greedy decode.
+        # DEFAULT OFF (0): the 106-page hard ablation proved it LOWERS CDM (0.9186 -> worse) because
+        # 858/942 GT formulas legitimately repeat a 4-gram (matrix rows, index runs) and banning it
+        # forces a wrong token. The targeted runaway guard below replaces it as the loop fix. Opt-in
+        # only via TORVEX_UNIREC_NO_REPEAT_NGRAM for experiments.
+        try:
+            self._no_repeat_ngram = max(0, int(os.getenv("TORVEX_UNIREC_NO_REPEAT_NGRAM", "0")))
+        except Exception:
+            self._no_repeat_ngram = 0
+        # runaway-loop guard: stop when the tail is one short token block repeated back-to-back
+        # >= N times. This is what an actual decode loop looks like (e.g. "&{}^{-}\\" x400, gt=78
+        # tokens -> pred=2954) and it is structurally distinct from a legitimate repeat: a real
+        # matrix repeats STRUCTURE but the cell contents differ (a_{11} & a_{12} -> the exact token
+        # block does NOT recur), so this never fires on the 858 legitimately-repeating formulas the
+        # way no-repeat-ngram does. 21/942 hard formulas looped, burning ~40% of all decode tokens.
+        try:
+            self._loop_min_repeats = max(3, int(os.getenv("TORVEX_UNIREC_LOOP_MIN_REPEATS", "10")))
+        except Exception:
+            self._loop_min_repeats = 10
+        self._loop_max_period = 24
+
+        # VELOX speculative decode: use the multi-token verify decoder when present + enabled.
+        # Lossless (byte-identical to greedy) so it is safe as the default. Disabled automatically
+        # when no-repeat-ngram is on, because banning tokens changes the argmax the draft must match.
+        self.use_velox = (os.getenv("TORVEX_UNIREC_VELOX", "1") != "0"
+                          and os.path.exists(velox_dec)
+                          and self._no_repeat_ngram == 0)
+        try:
+            self._velox_k = max(1, int(os.getenv("TORVEX_UNIREC_VELOX_K", "16")))
+        except Exception:
+            self._velox_k = 16
+        self._velox_ngram = 3  # match the last (ngram-1)=2 tokens against earlier output
 
         # torvex provider helper does the Windows CUDA-DLL preload (cublasLt/cudnn).
         try:
@@ -117,19 +159,11 @@ class UniRecRecognizer:
 
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        dec = velox_dec if self.use_velox else base_dec
         self.decoder_session = ort.InferenceSession(dec, so, providers=providers)
         self.encoder_session = ort.InferenceSession(enc, so, providers=providers)
         self.processor = _ImageProcessor()
         self.tokenizer = _Tokenizer(mapping)
-        self.max_length = max_length
-        # no-repeat-ngram: ban any n-gram of token ids from recurring in the greedy decode.
-        # Phrase-repetition loops on hard/ambiguous formula crops (e.g. a "{r+1}\\"-style cycle
-        # repeating to max_length) slip past the low-diversity guard because the cycle has >4
-        # distinct tokens. Banning the repeated n-gram forces the decode off the loop. 0 disables.
-        try:
-            self._no_repeat_ngram = max(0, int(os.getenv("TORVEX_UNIREC_NO_REPEAT_NGRAM", "4")))
-        except Exception:
-            self._no_repeat_ngram = 4
 
         # CUDA arena shrinkage: free the arena after the (variable-size) encoder run so VRAM
         # doesn't ratchet up to the largest crop ever seen. The model is stateless across crops,
@@ -139,27 +173,35 @@ class UniRecRecognizer:
             self._run_options = ort.RunOptions()
             self._run_options.add_run_config_entry("memory.enable_memory_arena_shrinkage", "gpu:0")
 
-        # float dtype the model expects (float32 or, for the quantized build, float16)
+        # float dtype the models expect (float32 or, for a quantized build, float16). The base
+        # decoder exposes cross_k; the velox decoder exposes past_self_k_0 + encoder_hidden_states.
         enc_in = {i.name: i.type for i in self.encoder_session.get_inputs()}
         dec_in = {i.name: i.type for i in self.decoder_session.get_inputs()}
         self._pix_dtype = np.float16 if "float16" in enc_in.get("pixel_values", "") else np.float32
-        self._fdtype = np.float16 if "float16" in dec_in.get("cross_k", "") else np.float32
+        _probe = dec_in.get("cross_k") or dec_in.get("past_self_k_0") or ""
+        self._fdtype = np.float16 if "float16" in _probe else np.float32
 
+        # decoder geometry from whichever decoder is loaded (base: past_key_N, velox: past_self_k_N)
         self.num_decoder_layers = 0
         self.num_heads = None
         self.head_dim = None
         for inp in self.decoder_session.get_inputs():
-            if "past_key" in inp.name:
-                idx = int(inp.name.split("_")[-1])
-                self.num_decoder_layers = max(self.num_decoder_layers, idx + 1)
+            nm = inp.name
+            suffix = None
+            if nm.startswith("past_key_"):
+                suffix = nm[len("past_key_"):]
+            elif nm.startswith("past_self_k_"):
+                suffix = nm[len("past_self_k_"):]
+            if suffix is not None and suffix.isdigit():
+                self.num_decoder_layers = max(self.num_decoder_layers, int(suffix) + 1)
                 if len(inp.shape) == 4:
                     if self.num_heads is None and isinstance(inp.shape[1], int):
                         self.num_heads = inp.shape[1]
                     if self.head_dim is None and isinstance(inp.shape[3], int):
                         self.head_dim = inp.shape[3]
-        logger.info("UniRec loaded: providers=%s layers=%s heads=%s head_dim=%s vocab=%s",
+        logger.info("UniRec loaded: providers=%s layers=%s heads=%s head_dim=%s vocab=%s velox=%s",
                     providers, self.num_decoder_layers, self.num_heads, self.head_dim,
-                    self.tokenizer.vocab_size)
+                    self.tokenizer.vocab_size, self.use_velox)
 
     def preflight(self):
         return None
@@ -180,6 +222,39 @@ class UniRecRecognizer:
         pixel_values = self.processor(image).astype(self._pix_dtype)
         enc = self.encoder_session.run(None, {"pixel_values": pixel_values}, self._run_options)
         return enc[0], enc[1], enc[2]  # hidden, cross_k, cross_v
+
+    def _is_runaway_loop(self, generated):
+        """True if the tail is one short token block repeated back-to-back >= min_repeats times.
+
+        Discriminates a decode loop (exact block recurs identically) from a legitimate repeated
+        structure (matrix/array cells differ in subscripts, so the exact token block does NOT
+        recur). Cheap: at most loop_max_period * min_repeats slice compares, and short-circuits.
+        """
+        g = generated
+        n = len(g)
+        reps = self._loop_min_repeats
+        for p in range(1, self._loop_max_period + 1):
+            if n < p * reps:
+                break  # not enough tokens for `reps` blocks of any period >= p
+            block = g[-p:]
+            if all(g[-p * r:n - p * (r - 1)] == block for r in range(2, reps + 1)):
+                return True
+        return False
+
+    def _hit_stop_guard(self, generated):
+        """Shared early-stop checks (degeneracy + runaway loop) used by both decode paths."""
+        if len(generated) >= 48 and len(set(generated[-48:])) <= 4:
+            return True
+        return self._is_runaway_loop(generated)
+
+    def _infer(self, image: Image.Image) -> str:
+        if self.use_velox:
+            generated = self._decode_velox(image)
+        else:
+            generated = self._decode_greedy(image)
+        return clean_special_tokens(self.tokenizer.decode(generated)).strip()
+
+    # ---- base greedy decode (single token per step) --------------------------------------------
 
     def _decode_step(self, input_id, past_length, cross_k, cross_v, past_kv, padding_idx):
         decoder_inputs = {
@@ -207,7 +282,7 @@ class UniRecRecognizer:
                 banned.add(generated[i + n - 1])
         return banned
 
-    def _infer(self, image: Image.Image) -> str:
+    def _decode_greedy(self, image: Image.Image):
         bos, eos, pad = (self.tokenizer.bos_token_id,
                          self.tokenizer.eos_token_id,
                          self.tokenizer.pad_token_id)
@@ -229,9 +304,65 @@ class UniRecRecognizer:
             generated.append(nxt)
             if nxt == eos:
                 break
-            # repetition/degeneracy guard: greedy decode can fall into a loop (e.g. a run of
-            # "----" to max_length, a 245s page). If the last window has <=4 distinct tokens it's
-            # degenerate -> stop. Natural text/latex has many distinct tokens in any 48-token span.
-            if step >= 48 and len(set(generated[-48:])) <= 4:
+            if self._hit_stop_guard(generated):
                 break
-        return clean_special_tokens(self.tokenizer.decode(generated)).strip()
+        return generated
+
+    # ---- VELOX n-gram self-speculative decode (lossless, ~1.7x on formulas) ---------------------
+
+    def _velox_step(self, input_ids, enc_hidden, past_self):
+        feeds = {"input_ids": np.asarray(input_ids, dtype=np.int64).reshape(1, -1),
+                 "encoder_hidden_states": enc_hidden}
+        for i in range(self.num_decoder_layers):
+            feeds[f"past_self_k_{i}"] = past_self[2 * i]
+            feeds[f"past_self_v_{i}"] = past_self[2 * i + 1]
+        outs = self.decoder_session.run(None, feeds, self._run_options)
+        return outs[0], list(outs[1:])  # logits [1,K,vocab], present self-KV [k0,v0,k1,v1,...]
+
+    def _draft_ngram(self, generated):
+        """Propose the next tokens by finding the most recent earlier occurrence of the current
+        suffix and copying what followed it (Prompt-Lookup-style, but over our own output)."""
+        n, K = self._velox_ngram, self._velox_k
+        if len(generated) < n:
+            return []
+        suffix = tuple(generated[-(n - 1):])
+        for j in range(len(generated) - (n - 1) - 1, -1, -1):
+            if tuple(generated[j:j + n - 1]) == suffix:
+                return generated[j + n - 1: j + n - 1 + K]
+        return []
+
+    def _decode_velox(self, image: Image.Image):
+        bos, eos = self.tokenizer.bos_token_id, self.tokenizer.eos_token_id
+        nh, hd, nl = self.num_heads, self.head_dim, self.num_decoder_layers
+        enc_hidden = self._encode(image)[0].astype(self._fdtype)
+        past = [np.zeros((1, nh, 0, hd), dtype=self._fdtype) for _ in range(2 * nl)]
+
+        # seed one token so there is something to draft against
+        logits, past = self._velox_step([bos], enc_hidden, past)
+        generated = [bos, int(np.argmax(logits[0, -1]))]
+        if generated[-1] == eos:
+            return generated
+
+        while len(generated) < self.max_length and generated[-1] != eos:
+            draft = self._draft_ngram(generated)
+            block = [generated[-1]] + draft               # last committed token + drafts
+            logits, present = self._velox_step(block, enc_hidden, past)
+            preds = np.argmax(logits[0], axis=-1)         # model's greedy pick at each fed position
+            # pos 0 predicts the true next token after generated[-1]; always accept it. Then walk
+            # the drafts: keep accepting while each draft equals what greedy would have produced.
+            accepted = [int(preds[0])]
+            for i, d in enumerate(draft):
+                if d == accepted[i]:
+                    accepted.append(int(preds[i + 1]))
+                else:
+                    break
+            generated.extend(accepted)
+            # roll the self-KV cache back to the committed length (drop the rejected-draft tail)
+            keep = len(generated) - 1
+            past = [p[:, :, :keep, :] for p in present]
+            if eos in accepted:
+                generated = generated[:len(generated) - len(accepted) + accepted.index(eos) + 1]
+                break
+            if self._hit_stop_guard(generated):
+                break
+        return generated[:self.max_length]
