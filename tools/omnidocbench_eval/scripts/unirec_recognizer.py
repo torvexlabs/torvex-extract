@@ -170,6 +170,23 @@ class UniRecRecognizer:
         present = [(outs[1 + i * 2], outs[1 + i * 2 + 1]) for i in range(self.num_decoder_layers)]
         return logits, present
 
+    def _is_runaway_loop(self, generated, reps=10, max_period=24):
+        """True if the tail is one short token block repeated back-to-back >= reps times.
+
+        A decode loop repeats an EXACT token block (e.g. "&{}^{-}\\" x400); a legitimate matrix
+        repeats structure but cell contents differ, so the exact block does not recur. Mirrors the
+        production guard in src/torvex_extract/unirec_recognizer.py.
+        """
+        g = generated
+        n = len(g)
+        for p in range(1, max_period + 1):
+            if n < p * reps:
+                break
+            block = g[-p:]
+            if all(g[-p * r:n - p * (r - 1)] == block for r in range(2, reps + 1)):
+                return True
+        return False
+
     def _infer(self, image: Image.Image) -> str:
         bos, eos, pad = (self.tokenizer.bos_token_id,
                          self.tokenizer.eos_token_id,
@@ -186,6 +203,10 @@ class UniRecRecognizer:
             nxt = int(np.argmax(logits[0, -1, :]))
             generated.append(nxt)
             if nxt == eos:
+                break
+            # runaway-loop guard: short token block repeating back-to-back many times = decode
+            # loop, not real math -> stop before max_length (kills the 15-40s tail + garbage).
+            if step >= 10 and self._is_runaway_loop(generated):
                 break
         return clean_special_tokens(self.tokenizer.decode(generated)).strip()
 
