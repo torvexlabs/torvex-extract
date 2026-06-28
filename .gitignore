@@ -36,3 +36,8 @@ overlays_v16_worst/
 cdm_106_debug/
 overlay_display_gt_cdm_296/
 overlay_r0_gt_cdm_296/
+
+# Kaggle / LoRA / Velox training-lab scratch (kept locally, not in repo)
+.codex_tools/
+kaggle_*/
+overlay_display_gt_296/
